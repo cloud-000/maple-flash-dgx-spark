@@ -47,16 +47,22 @@ def rtn4_embedding(
     return recon.reshape(*codes.shape[:-1], k)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 32, "BLOCK_K_WORDS": 8}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K_WORDS": 8}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_N": 128, "BLOCK_K_WORDS": 8}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K_WORDS": 16}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_N": 32, "BLOCK_K_WORDS": 32}, num_warps=4, num_stages=3),
-    ],
-    key=["N", "nwords"],
-)
+def _rtn4_launch_meta(nwords: int, batch: int) -> tuple[int, int, int, int]:
+    """BLOCK_N, BLOCK_K_WORDS, warps, stages.
+
+    One K-tile is one RTN group (8 uint32 = 64 codes) so scale/bias are scalars
+    per output row, not a ``[BLOCK_N, BLOCK_K]`` load. Decode (batch=1) uses
+    skinny ``BLOCK_N`` so GB10's 48 SMs stay busy on the 152k-row lm_head.
+    """
+    # 8 words × 8 codes/word = 64 = HEAD_GROUP_SIZE.
+    block_k_words = 8
+    if batch == 1:
+        # lm_head N=152k: fat BLOCK_N still leaves thousands of CTAs; 2 warps
+        # raises occupancy vs 4-warp tiles (1.36 ms / ~143 GB/s on GB10).
+        return 64, block_k_words, 2, 2
+    return 32, block_k_words, 4, 3
+
+
 @triton.jit
 def _rtn4_gemv_kernel(
     x_ptr,
@@ -90,6 +96,7 @@ def _rtn4_gemv_kernel(
 
     BLOCK_K: tl.constexpr = BLOCK_K_WORDS * 8
     shifts = (tl.arange(0, 8) * 4).to(tl.uint32)
+    k_total = nwords * 8
 
     for w0 in range(0, nwords, BLOCK_K_WORDS):
         offs_w = w0 + tl.arange(0, BLOCK_K_WORDS)
@@ -103,24 +110,25 @@ def _rtn4_gemv_kernel(
         q = tl.reshape(codes.to(tl.float32), (BLOCK_N, BLOCK_K))
 
         offs_k = w0 * 8 + tl.arange(0, BLOCK_K)
-        mask_k = offs_k < (nwords * 8)
+        mask_k = offs_k < k_total
         x_tile = tl.load(
             x_row + offs_k * stride_xk,
             mask=mask_k,
             other=0.0,
         ).to(tl.float32)
-        group = offs_k // GROUP_SIZE
+        # Tile is one RTN group: one scale/bias per output row, not per K.
+        group = (w0 * 8) // GROUP_SIZE
         scale = tl.load(
-            scale_ptr + offs_n[:, None] * stride_sn + group[None, :] * stride_sg,
-            mask=mask_n[:, None] & mask_k[None, :],
+            scale_ptr + offs_n * stride_sn + group * stride_sg,
+            mask=mask_n,
             other=0.0,
         ).to(tl.float32)
         bias = tl.load(
-            bias_ptr + offs_n[:, None] * stride_bn + group[None, :] * stride_bg,
-            mask=mask_n[:, None] & mask_k[None, :],
+            bias_ptr + offs_n * stride_bn + group * stride_bg,
+            mask=mask_n,
             other=0.0,
         ).to(tl.float32)
-        acc += tl.sum((q * scale + bias) * x_tile[None, :], axis=1)
+        acc += scale * tl.sum(q * x_tile[None, :], axis=1) + bias * tl.sum(x_tile, axis=0)
 
     tl.store(
         y_ptr + pid_b * stride_yb + offs_n * stride_yn,
@@ -135,6 +143,8 @@ def rtn4_gemv(
     scales: torch.Tensor,
     biases: torch.Tensor,
     group_size: int = HEAD_GROUP_SIZE,
+    *,
+    packed_kn: bool = False,
 ) -> torch.Tensor:
     """Decode GEMV ``y = x @ W`` with 4-bit packed ``W`` (affine RTN)."""
     if packed_weight.dtype != torch.uint32:
@@ -144,31 +154,53 @@ def rtn4_gemv(
         )
     if packed_weight.ndim != 2:
         raise ValueError(
-            f"packed_weight must be 2-D [N, K/8]; got shape {tuple(packed_weight.shape)}."
+            f"packed_weight must be 2-D [N, K/8] or [K/8, N]; got shape "
+            f"{tuple(packed_weight.shape)}."
         )
     if not x.is_cuda or not packed_weight.is_cuda:
         raise RuntimeError("rtn4_gemv requires CUDA tensors.")
 
-    n_out, nwords = packed_weight.shape
+    if packed_kn:
+        nwords, n_out = packed_weight.shape
+        stride_wn = packed_weight.stride(1)
+        stride_ww = packed_weight.stride(0)
+        n_groups = nwords * _CODES_PER_WORD // group_size
+        if scales.shape != (n_groups, n_out) or biases.shape != (n_groups, n_out):
+            raise ValueError(
+                f"packed_kn scales/biases expected {(n_groups, n_out)}, "
+                f"got {tuple(scales.shape)} and {tuple(biases.shape)}."
+            )
+        stride_sn = scales.stride(1)
+        stride_sg = scales.stride(0)
+        stride_bn = biases.stride(1)
+        stride_bg = biases.stride(0)
+    else:
+        n_out, nwords = packed_weight.shape
+        stride_wn = packed_weight.stride(0)
+        stride_ww = packed_weight.stride(1)
+        n_groups = nwords * _CODES_PER_WORD // group_size
+        if scales.shape != (n_out, n_groups) or biases.shape != (n_out, n_groups):
+            raise ValueError(
+                f"scales/biases expected {(n_out, n_groups)}, got {tuple(scales.shape)} "
+                f"and {tuple(biases.shape)}."
+            )
+        stride_sn = scales.stride(0)
+        stride_sg = scales.stride(1)
+        stride_bn = biases.stride(0)
+        stride_bg = biases.stride(1)
+
     k_in = nwords * _CODES_PER_WORD
-    n_groups = k_in // group_size
     if x.shape[-1] != k_in:
         raise ValueError(f"x last dim {x.shape[-1]} != packed K ({k_in}).")
-    if scales.shape != (n_out, n_groups) or biases.shape != (n_out, n_groups):
-        raise ValueError(
-            f"scales/biases expected {(n_out, n_groups)}, got {tuple(scales.shape)} "
-            f"and {tuple(biases.shape)}."
-        )
 
     leading = x.shape[:-1]
     batch = int(x.numel() // k_in)
     x_mat = x.reshape(batch, k_in)
     y = torch.empty(batch, n_out, device=x.device, dtype=x.dtype)
 
-    def _grid(meta):
-        return (triton.cdiv(n_out, meta["BLOCK_N"]), batch)
-
-    _rtn4_gemv_kernel[_grid](
+    block_n, block_k_words, num_warps, num_stages = _rtn4_launch_meta(nwords, batch)
+    grid = (triton.cdiv(n_out, block_n), batch)
+    _rtn4_gemv_kernel[grid](
         x_mat,
         packed_weight,
         scales,
@@ -178,14 +210,18 @@ def rtn4_gemv(
         nwords,
         x_mat.stride(0),
         x_mat.stride(1),
-        packed_weight.stride(0),
-        packed_weight.stride(1),
-        scales.stride(0),
-        scales.stride(1),
-        biases.stride(0),
-        biases.stride(1),
+        stride_wn,
+        stride_ww,
+        stride_sn,
+        stride_sg,
+        stride_bn,
+        stride_bg,
         y.stride(0),
         y.stride(1),
         GROUP_SIZE=group_size,
+        BLOCK_N=block_n,
+        BLOCK_K_WORDS=block_k_words,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return y.reshape(*leading, n_out)

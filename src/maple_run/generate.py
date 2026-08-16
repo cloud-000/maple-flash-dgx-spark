@@ -45,6 +45,15 @@ def generate(model_dir: str, prompt: str, max_tokens: int = 128) -> str:
         flush=True,
     )
 
+    with torch.inference_mode():
+        # JIT decode kernels (q_len=1 path) before the timed run.
+        model.forward(
+            torch.zeros(1, 1, dtype=torch.long, device=model.device),
+            cache=model.make_cache(max_len=8),
+            logits_to_keep=1,
+        )
+        torch.cuda.synchronize()
+
     cache = model.make_cache(max_len=prompt_len + max_tokens)
     torch.cuda.synchronize()
     t0 = time.perf_counter()

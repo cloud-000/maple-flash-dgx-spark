@@ -51,6 +51,28 @@ def test_rtn4_gemv_matches_dequantized_linear():
 
 
 @cuda
+def test_rtn4_gemv_packed_kn_matches_nk():
+    from maple_run.kernels.rtn4 import rtn4_gemv
+
+    rng = np.random.default_rng(2)
+    weight = rng.standard_normal((80, 128)).astype(np.float32)
+    packed, scales, biases = quantize_rtn(weight)
+    packed_t = torch.from_numpy(np.ascontiguousarray(packed)).cuda().to(torch.uint32)
+    scales_t = torch.from_numpy(np.ascontiguousarray(scales)).cuda()
+    biases_t = torch.from_numpy(np.ascontiguousarray(biases)).cuda()
+    x = torch.from_numpy(rng.standard_normal((1, 128)).astype(np.float32)).cuda()
+    y_nk = rtn4_gemv(x, packed_t, scales_t, biases_t)
+    y_kn = rtn4_gemv(
+        x,
+        packed_t.t().contiguous(),
+        scales_t.t().contiguous(),
+        biases_t.t().contiguous(),
+        packed_kn=True,
+    )
+    torch.testing.assert_close(y_kn, y_nk, rtol=1e-4, atol=1e-4)
+
+
+@cuda
 def test_rtn4_gemv_rejects_dense_weight():
     from maple_run.kernels.rtn4 import rtn4_gemv
 

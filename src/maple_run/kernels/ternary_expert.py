@@ -14,11 +14,36 @@ import triton.language as tl
 _CODES_PER_WORD = 16
 
 
+def _expert_nk(
+    packed_weight: torch.Tensor, packed_kn: bool
+) -> tuple[int, int, int, int, int, int]:
+    """Return n_exp, n_out, nwords, stride_we, stride_wn, stride_ww."""
+    if packed_kn:
+        n_exp, nwords, n_out = packed_weight.shape
+        return (
+            n_exp,
+            n_out,
+            nwords,
+            packed_weight.stride(0),
+            packed_weight.stride(2),
+            packed_weight.stride(1),
+        )
+    n_exp, n_out, nwords = packed_weight.shape
+    return (
+        n_exp,
+        n_out,
+        nwords,
+        packed_weight.stride(0),
+        packed_weight.stride(1),
+        packed_weight.stride(2),
+    )
+
+
 def _expert_launch_meta(nwords: int) -> tuple[int, int, int, int]:
     if nwords >= 64:
-        return 16, 64, 4, 3
+        return 8, 64, 4, 2
     if nwords >= 32:
-        return 16, 32, 4, 4
+        return 8, 32, 4, 4
     return 16, 8, 4, 2
 
 
@@ -91,6 +116,8 @@ def ternary_expert_gemv(
     packed_weight: torch.Tensor,
     row_alpha: torch.Tensor,
     expert_ids: torch.Tensor,
+    *,
+    packed_kn: bool = False,
 ) -> torch.Tensor:
     """Indexed packed GEMV for stacked experts.
 
@@ -101,7 +128,7 @@ def ternary_expert_gemv(
         ``expert_ids`` shaped ``[..., topk]``) or one row per slot
         (``x.shape[:-1] == expert_ids.shape``).
     packed_weight:
-        ``uint32`` codes ``[E, N, K/16]``.
+        ``uint32`` codes ``[E, N, K/16]`` or ``[E, K/16, N]`` if ``packed_kn``.
     row_alpha:
         Per-expert per-output-row scale ``[E, N]``.
     expert_ids:
@@ -125,7 +152,9 @@ def ternary_expert_gemv(
     if not expert_ids.is_cuda:
         raise RuntimeError("expert_ids must be a CUDA tensor (no GPU→CPU routing).")
 
-    n_exp, n_out, nwords = packed_weight.shape
+    n_exp, n_out, nwords, stride_we, stride_wn, stride_ww = _expert_nk(
+        packed_weight, packed_kn
+    )
     k_in = nwords * _CODES_PER_WORD
     if x.shape[-1] != k_in:
         raise ValueError(f"x last dim {x.shape[-1]} != packed K ({k_in}).")
@@ -172,9 +201,9 @@ def ternary_expert_gemv(
         nwords,
         slot_x.stride(0),
         slot_x.stride(1),
-        packed_weight.stride(0),
-        packed_weight.stride(1),
-        packed_weight.stride(2),
+        stride_we,
+        stride_wn,
+        stride_ww,
         row_alpha.stride(0),
         row_alpha.stride(1),
         y.stride(0),
@@ -356,6 +385,8 @@ def ternary_expert_swiglu(
     packed_weight: torch.Tensor,
     row_alpha: torch.Tensor,
     expert_ids: torch.Tensor,
+    *,
+    packed_kn: bool = False,
 ) -> torch.Tensor:
     """Indexed up+gate GEMV with SiLU/clamp fused. Packed rows are ``[up; gate]``.
 
@@ -363,10 +394,12 @@ def ternary_expert_swiglu(
     Returns activated expert hidden ``[..., topk, N]`` with ``N = packed N / 2``.
     """
     if packed_weight.ndim != 3 or packed_weight.dtype != torch.uint32:
-        raise ValueError("packed_weight must be uint32 [E, 2N, K/16].")
+        raise ValueError("packed_weight must be uint32 [E, 2N, K/16] or [E, K/16, 2N].")
     if not x.is_cuda or not packed_weight.is_cuda or not expert_ids.is_cuda:
         raise RuntimeError("ternary_expert_swiglu requires CUDA tensors.")
-    n_exp, n_rows, nwords = packed_weight.shape
+    n_exp, n_rows, nwords, stride_we, stride_wn, stride_ww = _expert_nk(
+        packed_weight, packed_kn
+    )
     if n_rows % 2 != 0:
         raise ValueError(f"packed up_gate rows must be even, got {n_rows}.")
     n_out = n_rows // 2
@@ -398,9 +431,9 @@ def ternary_expert_swiglu(
         nwords,
         x_mat.stride(0),
         x_mat.stride(1),
-        packed_weight.stride(0),
-        packed_weight.stride(1),
-        packed_weight.stride(2),
+        stride_we,
+        stride_wn,
+        stride_ww,
         row_alpha.stride(0),
         row_alpha.stride(1),
         y.stride(0),
@@ -421,6 +454,8 @@ def ternary_expert_down_sum(
     expert_ids: torch.Tensor,
     topk_weight: torch.Tensor,
     residual: torch.Tensor | None = None,
+    *,
+    packed_kn: bool = False,
 ) -> torch.Tensor:
     """Down-proj GEMV, weighted sum over top-k, optional residual add. One launch.
 
@@ -428,10 +463,12 @@ def ternary_expert_down_sum(
     Returns ``[..., N]`` (top-k reduced).
     """
     if packed_weight.ndim != 3 or packed_weight.dtype != torch.uint32:
-        raise ValueError("packed_weight must be uint32 [E, N, K/16].")
+        raise ValueError("packed_weight must be uint32 [E, N, K/16] or [E, K/16, N].")
     if not x.is_cuda or not packed_weight.is_cuda or not expert_ids.is_cuda:
         raise RuntimeError("ternary_expert_down_sum requires CUDA tensors.")
-    n_exp, n_out, nwords = packed_weight.shape
+    n_exp, n_out, nwords, stride_we, stride_wn, stride_ww = _expert_nk(
+        packed_weight, packed_kn
+    )
     k_in = nwords * _CODES_PER_WORD
     if x.shape[-1] != k_in:
         raise ValueError(f"x last dim {x.shape[-1]} != packed K ({k_in}).")
@@ -471,9 +508,9 @@ def ternary_expert_down_sum(
         x_mat.stride(0),
         x_mat.stride(1),
         x_mat.stride(2),
-        packed_weight.stride(0),
-        packed_weight.stride(1),
-        packed_weight.stride(2),
+        stride_we,
+        stride_wn,
+        stride_ww,
         row_alpha.stride(0),
         row_alpha.stride(1),
         ids.stride(0),

@@ -21,7 +21,7 @@ def _gemv_launch_meta(nwords: int, batch: int) -> tuple[int, int, int, int]:
     """BLOCK_N, BLOCK_K_WORDS, warps, stages. Decode (batch=1) needs many CTAs + fat K tiles."""
     if batch == 1:
         if nwords >= 64:
-            return 16, 64, 4, 3
+            return 16, 64, 4, 4
         if nwords >= 32:
             return 16, 32, 4, 4
         return 16, 8, 4, 2
@@ -111,6 +111,7 @@ def ternary_gemv(
     *,
     rms_weight: torch.Tensor | None = None,
     rms_eps: float = 1e-6,
+    packed_kn: bool = False,
 ) -> torch.Tensor:
     """Decode GEMV ``y = x @ W`` with ``W`` kept as packed uint32 codes.
 
@@ -119,11 +120,14 @@ def ternary_gemv(
     x:
         Activations ``[K]`` or ``[B, K]`` (any leading dims are flattened).
     packed_weight:
-        ``uint32`` codes ``[N, K/16]``.
+        ``uint32`` codes ``[N, K/16]`` (``packed_kn=False``) or ``[K/16, N]``
+        (``packed_kn=True``, coalesced consecutive output rows).
     row_alpha:
         Per-output-row scale ``[N]``.
     rms_weight:
         If set, RMSNorm ``x`` in-kernel (fused input RMSNorm + GEMV).
+    packed_kn:
+        If True, packed codes are stored ``[nwords, N]``.
     """
     if not x.is_cuda or not packed_weight.is_cuda or not row_alpha.is_cuda:
         raise RuntimeError("ternary_gemv requires CUDA tensors (packed weights stay on GPU).")
@@ -134,11 +138,18 @@ def ternary_gemv(
         )
     if packed_weight.ndim != 2:
         raise ValueError(
-            f"packed_weight must be 2-D [N, K/16]; got shape {tuple(packed_weight.shape)}. "
-            "Stacked experts are a later fused kernel."
+            f"packed_weight must be 2-D [N, K/16] or [K/16, N]; got shape "
+            f"{tuple(packed_weight.shape)}. Stacked experts are a later fused kernel."
         )
 
-    n_out, nwords = packed_weight.shape
+    if packed_kn:
+        nwords, n_out = packed_weight.shape
+        stride_wn = packed_weight.stride(1)
+        stride_ww = packed_weight.stride(0)
+    else:
+        n_out, nwords = packed_weight.shape
+        stride_wn = packed_weight.stride(0)
+        stride_ww = packed_weight.stride(1)
     k_in = nwords * _CODES_PER_WORD
     alpha = row_alpha.reshape(-1)
     if alpha.numel() != n_out:
@@ -169,8 +180,8 @@ def ternary_gemv(
         nwords,
         x_mat.stride(0),
         x_mat.stride(1),
-        packed_weight.stride(0),
-        packed_weight.stride(1),
+        stride_wn,
+        stride_ww,
         alpha.stride(0),
         y.stride(0),
         y.stride(1),

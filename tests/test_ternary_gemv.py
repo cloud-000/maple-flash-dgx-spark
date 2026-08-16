@@ -204,3 +204,16 @@ def test_rejects_non_uint32_packed_weight():
     alpha = torch.ones(16, device="cuda")
     with pytest.raises(TypeError, match="uint32"):
         ternary_gemv(x, fake, alpha)
+
+
+@cuda
+def test_packed_kn_matches_nk_layout():
+    from maple_run.kernels.ternary_gemv import ternary_gemv
+
+    rng = np.random.default_rng(4)
+    packed, alpha = ternarize(rng.standard_normal((96, 256)).astype(np.float32))
+    packed_t, alpha_t = _to_cuda_packed(packed, alpha)
+    x = torch.from_numpy(rng.standard_normal((1, 256)).astype(np.float32)).cuda()
+    y_nk = ternary_gemv(x, packed_t, alpha_t)
+    y_kn = ternary_gemv(x, packed_t.t().contiguous(), alpha_t, packed_kn=True)
+    torch.testing.assert_close(y_kn, y_nk, rtol=1e-4, atol=1e-4)

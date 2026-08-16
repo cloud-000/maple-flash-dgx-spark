@@ -163,3 +163,61 @@ def test_decode_attn_matches_sdpa():
     )
     torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
     assert pos is not None
+
+
+@cuda
+def test_decode_attn_does_not_need_padded_tail():
+    """GQA must match SDPA when the cache is much longer than seqlen."""
+    from maple_run.kernels.decode_attn import apply_qkv_decode, decode_gqa_attn
+    from maple_run.kernels.fused_norm import rms_norm
+    from maple_run.model import _apply_rotary_pos_emb
+
+    bsz, n_q, n_kv, d, max_len = 1, 4, 2, 64, 1024
+    rotary_dim = 32
+    q_w = torch.ones(d, device="cuda")
+    k_w = torch.ones(d, device="cuda")
+    qkv = torch.randn(1, (n_q + 2 * n_kv) * d, device="cuda", dtype=torch.float32)
+    k_cache = torch.zeros(bsz, n_kv, max_len, d, device="cuda")
+    v_cache = torch.zeros(bsz, n_kv, max_len, d, device="cuda")
+    k_cache[:, :, :7] = torch.randn(bsz, n_kv, 7, d, device="cuda")
+    v_cache[:, :, :7] = torch.randn(bsz, n_kv, 7, d, device="cuda")
+    seqlen = torch.tensor(7, device="cuda", dtype=torch.int64)
+    dummy = torch.linspace(0, 1, rotary_dim, device="cuda")
+    cos = dummy.cos().view(1, 1, rotary_dim)
+    sin = dummy.sin().view(1, 1, rotary_dim)
+
+    q = apply_qkv_decode(
+        qkv,
+        q_w,
+        k_w,
+        cos,
+        sin,
+        k_cache,
+        v_cache,
+        seqlen,
+        num_heads=n_q,
+        num_kv_heads=n_kv,
+        head_dim=d,
+        rotary_dim=rotary_dim,
+        use_rope=True,
+        use_qk_norm=True,
+        eps=1e-6,
+    )
+    out = decode_gqa_attn(q, k_cache, v_cache, seqlen, scale=d**-0.5, window=None)
+
+    q_s, k_s, v_s = qkv.split([n_q * d, n_kv * d, n_kv * d], dim=-1)
+    q_s = q_s.view(1, 1, n_q, d).transpose(1, 2)
+    k_s = k_s.view(1, 1, n_kv, d).transpose(1, 2)
+    v_s = v_s.view(1, 1, n_kv, d).transpose(1, 2)
+    q_s = rms_norm(q_s, q_w, 1e-6)
+    k_s = rms_norm(k_s, k_w, 1e-6)
+    q_s, k_s = _apply_rotary_pos_emb(q_s, k_s, cos, sin)
+    k_ref = k_cache.clone()
+    v_ref = v_cache.clone()
+    k_ref[:, :, 7:8] = k_s
+    v_ref[:, :, 7:8] = v_s
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        q_s, k_ref[:, :, :8], v_ref[:, :, :8], scale=d**-0.5, enable_gqa=True
+    )
+    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+

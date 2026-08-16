@@ -1,7 +1,8 @@
 """Decode-step attention: QK RMSNorm + partial RoPE + GQA, KV stays preallocated.
 
 Prefill still uses torch SDPA. This path is q_len=1 so the KV write index and
-length can live in device tensors (CUDA-graph safe).
+length can live in device tensors (CUDA-graph safe). The GQA loop walks only
+``seqlen`` (and the sliding window), not the padded cache ``max_len``.
 """
 
 from __future__ import annotations
@@ -142,6 +143,7 @@ def _decode_gqa_kernel(
     seqlen_ptr,
     n_q_per_kv,
     scale,
+    max_len,
     stride_qh,
     stride_qd,
     stride_kh,
@@ -154,7 +156,6 @@ def _decode_gqa_kernel(
     stride_od,
     HEAD_DIM: tl.constexpr,
     BLOCK_T: tl.constexpr,
-    MAX_LEN: tl.constexpr,
     WINDOW: tl.constexpr,
 ):
     h = tl.program_id(0)
@@ -162,10 +163,12 @@ def _decode_gqa_kernel(
     offs_d = tl.arange(0, HEAD_DIM)
     q = tl.load(q_ptr + h * stride_qh + offs_d * stride_qd).to(tl.float32)
 
-    kv_len = tl.load(seqlen_ptr) + 1
+    kv_len = tl.minimum(tl.load(seqlen_ptr) + 1, max_len)
     start = 0
     if WINDOW > 0:
         start = tl.maximum(0, kv_len - WINDOW)
+    # Align the first tile so K/V loads stay coalesced; mask drops pad.
+    start_aligned = (start // BLOCK_T) * BLOCK_T
 
     m_i = -1.0e9
     l_i = 0.0
@@ -175,7 +178,7 @@ def _decode_gqa_kernel(
     k_row = k_ptr + kv_h * stride_kh
     v_row = v_ptr + kv_h * stride_vh
 
-    for t0 in range(0, MAX_LEN, BLOCK_T):
+    for t0 in range(start_aligned, kv_len, BLOCK_T):
         offs_t = t0 + tl.arange(0, BLOCK_T)
         mask_t = (offs_t >= start) & (offs_t < kv_len)
         k = tl.load(
@@ -286,6 +289,7 @@ def decode_gqa_attn(
         seqlen,
         n_q // n_kv,
         float(scale),
+        max_len,
         q2.stride(0),
         q2.stride(1),
         k_cache[0].stride(0),
@@ -298,7 +302,8 @@ def decode_gqa_attn(
         o2.stride(1),
         HEAD_DIM=head_dim,
         BLOCK_T=64,
-        MAX_LEN=max_len,
         WINDOW=win,
+        num_warps=4,
+        num_stages=2,
     )
     return out
