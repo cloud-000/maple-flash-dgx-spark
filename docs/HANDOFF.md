@@ -4,18 +4,19 @@ This document is for the **next session**. The previous session diagnosed why
 `vllm serve deepgrove/maple-preview` failed on Spark, why the Hugging Face CUDA
 Transformers path is slow, and what a packed-kernel runtime has to do.
 
-**Phase 1 (CPU pack + convert) is done.** Next session starts at **phase 2**
-(packed GEMV kernel). Do not re-convert unless the packed checkpoint is
-missing. Do not start with a web search for Maple, MLX, or Spark bandwidth;
-read `docs/SOURCES.md` and `AGENTS.md` first.
+**Phase 1 (CPU pack + convert) and phase 2 (packed GEMV kernel) are done.**
+Next session starts at **phase 3** (Maple forward + fused expert dispatch).
+Do not re-convert unless the packed checkpoint is missing. Do not start with a
+web search for Maple, MLX, or Spark bandwidth; read `docs/SOURCES.md` and
+`AGENTS.md` first.
 
 ## Status (2026-08-16)
 
 | Phase | State |
 |---|---|
 | 1 Pack / convert | **Done.** NumPy `ternarize` / `pack_2bit` / 4-bit RTN; streaming converter; tests in `tests/test_pack.py` and `tests/test_convert.py`. |
-| 2 Packed GEMV kernel | Not started (`maple_run/kernels/ternary_gemv.py` is still a stub). |
-| 3 Model decode | Not started |
+| 2 Packed GEMV kernel | **Done.** Triton packed GEMV in `maple_run/kernels/ternary_gemv.py`; never unpacks to dense bf16. Tests in `tests/test_ternary_gemv.py`. |
+| 3 Model decode | Not started (`maple_run/model.py` is still a stub). |
 | 4 FlashHead | Not started |
 | 5 HTTP | Not started |
 
@@ -212,14 +213,13 @@ completed on this host: **5.41 GB** packed output. Repo ids use the Hugging
 Face hub cache when the snapshot is already on disk (`snapshot_download(...,
 local_files_only=True)`); shards are read in place.
 
-### Phase 2 — one kernel
+### Phase 2 — one kernel — **done**
 
 `maple_run/kernels/ternary_gemv.py`: decode GEMV `y = x @ W` with `x` shape
-`[1, K]` or `[B, K]`, `W` packed, scale by `row_alpha`. Correctness vs
-dequantized `F.linear` on a small layer. **Fail the review if the kernel
-materializes a dense bf16 `W`.**
-
-Triton first. Raw `.cu` only if Triton is unusable on sm_121.
+`[1, K]` or `[B, K]`, `W` packed uint32, scale by `row_alpha`. Triton on this
+host (GB10 sm_121, torch 2.13.0+cu130). Correctness vs dequantized `F.linear`
+in fp32; the kernel does not materialize a dense bf16 `W`.
+`PackedTernaryLinear.forward` calls it. 3-D stacked experts are phase 3.
 
 ### Phase 3 — model decode
 
@@ -246,8 +246,8 @@ Only after packed decode works. Do not start here.
 | `src/maple_run/cli.py` | `convert` / `generate` subcommands |
 | `src/maple_run/pack.py` | CPU ternarize + pack_2bit + 4-bit RTN |
 | `src/maple_run/convert.py` | Streaming HF → packed safetensors |
-| `src/maple_run/kernels/ternary_gemv.py` | Packed GEMV (stub) |
-| `src/maple_run/linear.py` | Packed linear module (stub) |
+| `src/maple_run/kernels/ternary_gemv.py` | Packed GEMV (Triton) |
+| `src/maple_run/linear.py` | PackedTernaryLinear → ternary_gemv |
 | `src/maple_run/model.py` | MapleForCausalLM (stub) |
 | `src/maple_run/generate.py` | Generate helper (stub) |
 | `docs/sources/mlx_lm_ternary.py` | **Authoritative packer** (DeepGrove, MIT) |
@@ -257,9 +257,10 @@ Only after packed decode works. Do not start here.
 ## Dependencies
 
 `pyproject.toml` has CPU convert deps (`safetensors`, `huggingface-hub`,
-`numpy`). CUDA extras (`torch`, `triton`) are optional and **not pinned**:
-confirm Spark's existing PyTorch before `uv add`. Tokenizer extra is
-`transformers>=4.57.0` (model card `transformers_version` 4.57.1).
+`numpy`). CUDA extra is pinned to this host's stack: `torch==2.13.0` /
+`triton==3.7.1` (PyPI manylinux aarch64 CUDA 13.0, same as `2.13.0+cu130`).
+Tokenizer extra is `transformers>=4.57.0` (model card `transformers_version`
+4.57.1).
 
 ## Out of scope unless the user asks
 

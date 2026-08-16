@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from maple_run.kernels.ternary_gemv import ternary_gemv
+
 
 class PackedTernaryLinear:
     def __init__(self, packed_weight, row_alpha):
@@ -9,6 +11,6 @@ class PackedTernaryLinear:
         self.row_alpha = row_alpha
 
     def forward(self, x):
-        raise NotImplementedError(
-            "Phase 2: call maple_run.kernels.ternary_gemv. See docs/HANDOFF.md."
-        )
+        return ternary_gemv(x, self.packed_weight, self.row_alpha)
+
+    __call__ = forward

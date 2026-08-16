@@ -12,8 +12,8 @@ dependencies = [
 
 [project.optional-dependencies]
 cuda = [
-    "torch",
-    "triton",
+    "torch==2.13.0",
+    "triton==3.7.1",
 ]
 tokenizer = [
     "transformers>=4.57.0",
@@ -30,5 +30,7 @@ requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"
 
 [tool.uv]
-# Spark is aarch64 + CUDA. Do not uv-add a generic torch wheel until the
-# implementer confirms the host's existing PyTorch/CUDA stack. See AGENTS.md.
+# Confirmed 2026-08-16 on this DGX Spark (GB10, sm_121, aarch64, CUDA 13.0):
+# the host ComfyUI venv is torch 2.13.0+cu130 / triton 3.7.1. PyPI torch 2.13.0
+# for manylinux aarch64 is the CUDA 13.0 build (cuda-toolkit / cudnn-cu13 /
+# triton). Do not replace it with a CPU wheel.

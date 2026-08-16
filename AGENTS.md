@@ -17,10 +17,10 @@ hardware numbers. Vendored algorithm source is `docs/sources/mlx_lm_ternary.py`.
 1. **Pack** (`maple_run/pack.py`, `maple_run/convert.py`): **done.** CPU NumPy
    port of DeepGrove `ternarize` / `_pack_2bit` plus streaming convert. Packed
    checkpoint lives at `checkpoints/maple-2bit` (gitignored).
-2. **Kernels** (`maple_run/kernels/ternary_gemv.py`): packed GEMV that never
-   unpacks to a dense bf16 matrix. **Start here.**
+2. **Kernels** (`maple_run/kernels/ternary_gemv.py`): **done.** Packed GEMV that
+   never unpacks to a dense bf16 matrix.
 3. **Model** (`maple_run/model.py`): Maple forward with packed linears, fused
-   expert dispatch, then decode. FlashHead is later.
+   expert dispatch, then decode. FlashHead is later. **Start here.**
 
 Stop at the phase the user asked for. Do not skip packing tests to jump to a
 server.
@@ -29,8 +29,8 @@ server.
 
 - Work from the repository root with `uv`.
 - Python 3.12 (`requires-python = ">=3.12"`).
-- Do not `uv add torch` until you have confirmed this host's aarch64 CUDA
-  PyTorch. Spark is not a generic x86 wheel.
+- CUDA extra is `torch==2.13.0` / `triton==3.7.1`, confirmed on this GB10
+  (aarch64, CUDA 13.0, `2.13.0+cu130`). Do not swap in a CPU wheel.
 - Do not install Dao-AILab `flash_attn` into `~/Code/spark-vllm-docker` or its
   container image. That image is a separate project; Maple is not a supported
   vLLM architecture (`MapleForCausalLM`).
