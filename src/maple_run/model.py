@@ -19,6 +19,8 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
 
+from maple_run.kernels.decode_attn import apply_qkv_decode, decode_gqa_attn
+from maple_run.kernels.fused_norm import add_rms_norm, moe_reduce_add, rms_norm
 from maple_run.linear import (
     PackedRTN4Embedding,
     PackedRTN4Linear,
@@ -37,11 +39,7 @@ class MapleRMSNorm:
         self.eps = eps
 
     def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.float()
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        return (self.weight.float() * hidden_states).to(input_dtype)
+        return rms_norm(hidden_states, self.weight, self.eps)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -74,37 +72,81 @@ class MapleRotaryEmbedding:
         )
         self.inv_freq = inv_freq
         self.rotary_dim = rotary_dim
+        self.cos_table: torch.Tensor | None = None
+        self.sin_table: torch.Tensor | None = None
+        self.max_cached = 0
+        self.ensure_length(4096)
+
+    def ensure_length(self, n: int) -> None:
+        if n <= self.max_cached:
+            return
+        n = max(int(n), 64)
+        t = torch.arange(n, device=self.inv_freq.device, dtype=torch.float32)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.cos_table = emb.cos()
+        self.sin_table = emb.sin()
+        self.max_cached = n
+
+    def gather(self, position_ids: torch.Tensor, dtype: torch.dtype):
+        idx = position_ids.long()
+        if idx.numel() == 1:
+            cos = self.cos_table.index_select(0, idx.reshape(1)).to(dtype)
+            sin = self.sin_table.index_select(0, idx.reshape(1)).to(dtype)
+            return cos.view(*idx.shape, self.rotary_dim), sin.view(
+                *idx.shape, self.rotary_dim
+            )
+        return self.cos_table[idx].to(dtype), self.sin_table[idx].to(dtype)
 
     def __call__(self, position_ids: torch.Tensor, dtype: torch.dtype):
-        # position_ids: [B, L]
-        freqs = torch.einsum("bl,d->bld", position_ids.float(), self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos().to(dtype), emb.sin().to(dtype)
+        self.ensure_length(int(position_ids.max().item()) + 1)
+        return self.gather(position_ids, dtype)
 
 
 class KVCache:
-    """Per-layer K/V. Sliding-window layers keep the last ``window`` tokens."""
+    """Preallocated K/V. Decode writes in place at ``seqlen`` (CUDA-graph safe)."""
 
-    def __init__(self, layer_types: list[str], window: int):
+    def __init__(
+        self,
+        layer_types: list[str],
+        window: int,
+        *,
+        n_kv: int,
+        head_dim: int,
+        max_len: int,
+        batch: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
         self.layer_types = layer_types
         self.window = window
+        self.max_len = max_len
         n = len(layer_types)
-        self.k: list[torch.Tensor | None] = [None] * n
-        self.v: list[torch.Tensor | None] = [None] * n
+        self.k = [
+            torch.zeros(batch, n_kv, max_len, head_dim, dtype=dtype, device=device)
+            for _ in range(n)
+        ]
+        self.v = [
+            torch.zeros(batch, n_kv, max_len, head_dim, dtype=dtype, device=device)
+            for _ in range(n)
+        ]
+        self.seqlen = torch.zeros((), dtype=torch.int64, device=device)
         self.seen = 0
 
     def update(self, layer_idx: int, key_states: torch.Tensor, value_states: torch.Tensor):
-        k_prev, v_prev = self.k[layer_idx], self.v[layer_idx]
-        if k_prev is None:
-            k_all, v_all = key_states, value_states
-        else:
-            k_all = torch.cat([k_prev, key_states], dim=2)
-            v_all = torch.cat([v_prev, value_states], dim=2)
+        start = self.seen
+        end = start + key_states.shape[2]
+        if end > self.max_len:
+            raise RuntimeError(
+                f"KV cache overflow: need {end} slots, max_len={self.max_len}."
+            )
+        self.k[layer_idx][:, :, start:end].copy_(key_states)
+        self.v[layer_idx][:, :, start:end].copy_(value_states)
+        k_all = self.k[layer_idx][:, :, :end]
+        v_all = self.v[layer_idx][:, :, :end]
         if self.layer_types[layer_idx] == "sliding_attention":
             k_all = k_all[:, :, -self.window :]
             v_all = v_all[:, :, -self.window :]
-        self.k[layer_idx] = k_all
-        self.v[layer_idx] = v_all
         return k_all, v_all
 
 
@@ -153,9 +195,47 @@ class MapleAttention:
         cos: torch.Tensor,
         sin: torch.Tensor,
         cache: KVCache | None,
+        *,
+        rms_weight: torch.Tensor | None = None,
+        rms_eps: float = 1e-6,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.shape
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states, rms_weight=rms_weight, rms_eps=rms_eps)
+
+        if (
+            q_len == 1
+            and bsz == 1
+            and cache is not None
+            and self.use_qk_norm
+        ):
+            q = apply_qkv_decode(
+                qkv.reshape(1, -1),
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos,
+                sin,
+                cache.k[self.layer_idx],
+                cache.v[self.layer_idx],
+                cache.seqlen,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                rotary_dim=cos.shape[-1],
+                use_rope=self.use_rope,
+                use_qk_norm=True,
+                eps=self.q_norm.eps,
+            )
+            attn = decode_gqa_attn(
+                q,
+                cache.k[self.layer_idx],
+                cache.v[self.layer_idx],
+                cache.seqlen,
+                scale=self.scale,
+                window=self.sliding_window,
+            )
+            attn = attn.transpose(1, 2).reshape(bsz, q_len, -1)
+            return self.o_proj(attn)
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -205,7 +285,7 @@ class MapleSparseMoeBlock:
         self.top_k = top_k
         self.moe_intermediate = moe_intermediate
 
-    def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def __call__(self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         bsz, seq_len, hidden = hidden_states.shape
         x = hidden_states.reshape(-1, hidden)
         logits = F.linear(x.float(), self.gate_weight.float())
@@ -213,15 +293,10 @@ class MapleSparseMoeBlock:
         scores, topk_idx = torch.topk(routing, self.top_k, dim=-1)
         topk_weight = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
 
-        up_gate = self.up_gate(x, topk_idx)
-        up, gate = up_gate.split(self.moe_intermediate, dim=-1)
-        hidden_e = F.silu(gate.clamp(max=MLP_CLAMP)) * up.clamp(
-            min=-MLP_CLAMP, max=MLP_CLAMP
-        )
+        hidden_e = self.up_gate.swiglu(x, topk_idx)
         expert_out = self.down(hidden_e, topk_idx)
-        y = (expert_out.float() * topk_weight.unsqueeze(-1)).sum(dim=-2).to(
-            hidden_states.dtype
-        )
+        res = None if residual is None else residual.reshape(-1, hidden)
+        y = moe_reduce_add(expert_out, topk_weight, residual=res)
         return y.view(bsz, seq_len, hidden)
 
 
@@ -239,13 +314,22 @@ class MapleDecoderLayer:
         self.post_attention_layernorm = post_attention_layernorm
 
     def __call__(self, hidden_states, position_ids, cos, sin, cache):
-        residual = hidden_states
-        hidden_states = residual + self.self_attn(
-            self.input_layernorm(hidden_states), position_ids, cos, sin, cache
+        attn_out = self.self_attn(
+            hidden_states,
+            position_ids,
+            cos,
+            sin,
+            cache,
+            rms_weight=self.input_layernorm.weight,
+            rms_eps=self.input_layernorm.eps,
         )
-        residual = hidden_states
-        hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))
-        return hidden_states
+        hidden_states, mlp_in = add_rms_norm(
+            hidden_states,
+            attn_out,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
+        return self.mlp(mlp_in, residual=hidden_states)
 
 
 def _require_packed_format(config: dict) -> None:
@@ -496,8 +580,18 @@ class MapleForCausalLM:
             )
         self.layers = layers
 
-    def make_cache(self) -> KVCache:
-        return KVCache(self.layer_types, self.sliding_window)
+    def make_cache(self, max_len: int = 2048, batch: int = 1) -> KVCache:
+        self.rotary.ensure_length(max_len)
+        return KVCache(
+            self.layer_types,
+            self.sliding_window,
+            n_kv=self.num_kv_heads,
+            head_dim=self.head_dim,
+            max_len=max_len,
+            batch=batch,
+            dtype=self.dtype,
+            device=self.device,
+        )
 
     def forward(
         self,
@@ -510,16 +604,27 @@ class MapleForCausalLM:
             input_ids = input_ids.unsqueeze(0)
         hidden = self.word_embeddings(input_ids).to(self.dtype)
         bsz, seq_len, _ = hidden.shape
-        past = 0 if cache is None else cache.seen
-        position_ids = torch.arange(
-            past, past + seq_len, device=input_ids.device
-        ).unsqueeze(0).expand(bsz, -1)
-        cos, sin = self.rotary(position_ids, hidden.dtype)
+        if cache is None:
+            position_ids = torch.arange(
+                seq_len, device=input_ids.device, dtype=torch.long
+            ).unsqueeze(0).expand(bsz, -1)
+        elif seq_len == 1:
+            position_ids = cache.seqlen.view(1, 1).expand(bsz, 1)
+        else:
+            past = cache.seen
+            position_ids = torch.arange(
+                past, past + seq_len, device=input_ids.device, dtype=torch.long
+            ).unsqueeze(0).expand(bsz, -1)
+        cos, sin = self.rotary.gather(position_ids, hidden.dtype)
 
         for layer in self.layers:
             hidden = layer(hidden, position_ids, cos, sin, cache)
         if cache is not None:
-            cache.seen = past + seq_len
+            if seq_len == 1:
+                cache.seqlen.add_(1)
+            else:
+                cache.seen = cache.seen + seq_len
+                cache.seqlen.fill_(cache.seen)
         hidden = self.norm(hidden)
         if logits_to_keep:
             hidden = hidden[:, -logits_to_keep:, :]
@@ -534,11 +639,11 @@ class MapleForCausalLM:
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
 
-        cache = self.make_cache()
+        cache = self.make_cache(max_len=int(input_ids.shape[-1]) + int(max_tokens))
         logits = self.forward(input_ids, cache=cache, logits_to_keep=1)
         eos = self.eos_token_id
         out = [input_ids]
-        for _ in range(max_tokens):
+        for i in range(max_tokens):
             next_id = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             out.append(next_id)
             if eos is not None and int(next_id[0, 0]) == int(eos):

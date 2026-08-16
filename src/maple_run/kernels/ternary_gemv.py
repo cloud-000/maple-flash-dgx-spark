@@ -17,22 +17,24 @@ import triton.language as tl
 _CODES_PER_WORD = 16
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 16, "BLOCK_K_WORDS": 8}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 32, "BLOCK_K_WORDS": 8}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K_WORDS": 8}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_N": 32, "BLOCK_K_WORDS": 16}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_N": 16, "BLOCK_K_WORDS": 32}, num_warps=4, num_stages=3),
-    ],
-    key=["N", "nwords"],
-)
+def _gemv_launch_meta(nwords: int, batch: int) -> tuple[int, int, int, int]:
+    """BLOCK_N, BLOCK_K_WORDS, warps, stages. Decode (batch=1) needs many CTAs + fat K tiles."""
+    if batch == 1:
+        if nwords >= 64:
+            return 16, 64, 4, 3
+        if nwords >= 32:
+            return 16, 32, 4, 4
+        return 16, 8, 4, 2
+    return 32, 16, 4, 3
+
+
 @triton.jit
 def _ternary_gemv_kernel(
     x_ptr,
     packed_ptr,
     alpha_ptr,
     y_ptr,
+    rms_w_ptr,
     N,
     nwords,
     stride_xb,
@@ -42,6 +44,8 @@ def _ternary_gemv_kernel(
     stride_a,
     stride_yb,
     stride_yn,
+    eps,
+    HAS_RMS: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K_WORDS: tl.constexpr,
 ):
@@ -55,6 +59,17 @@ def _ternary_gemv_kernel(
 
     BLOCK_K: tl.constexpr = BLOCK_K_WORDS * 16
     shifts = (tl.arange(0, 16) * 2).to(tl.uint32)
+    k_total = nwords * 16
+
+    rstd = 1.0
+    if HAS_RMS:
+        sumsq = 0.0
+        for w0 in range(0, nwords, BLOCK_K_WORDS):
+            offs_k = w0 * 16 + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < k_total
+            xt = tl.load(x_row + offs_k * stride_xk, mask=mask_k, other=0.0).to(tl.float32)
+            sumsq += tl.sum(xt * xt, axis=0)
+        rstd = tl.rsqrt(sumsq / k_total + eps)
 
     for w0 in range(0, nwords, BLOCK_K_WORDS):
         offs_w = w0 + tl.arange(0, BLOCK_K_WORDS)
@@ -70,12 +85,15 @@ def _ternary_gemv_kernel(
 
         offs_k = w0 * 16 + tl.arange(0, BLOCK_K)
         # K == nwords * 16; mask invalid K from a partial word tile.
-        mask_k = offs_k < (nwords * 16)
+        mask_k = offs_k < k_total
         x_tile = tl.load(
             x_row + offs_k * stride_xk,
             mask=mask_k,
             other=0.0,
         ).to(tl.float32)
+        if HAS_RMS:
+            rms_w = tl.load(rms_w_ptr + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+            x_tile = x_tile * rstd * rms_w
         acc += tl.sum(ternary * x_tile[None, :], axis=1)
 
     alpha = tl.load(alpha_ptr + offs_n * stride_a, mask=mask_n, other=0.0).to(tl.float32)
@@ -90,6 +108,9 @@ def ternary_gemv(
     x: torch.Tensor,
     packed_weight: torch.Tensor,
     row_alpha: torch.Tensor,
+    *,
+    rms_weight: torch.Tensor | None = None,
+    rms_eps: float = 1e-6,
 ) -> torch.Tensor:
     """Decode GEMV ``y = x @ W`` with ``W`` kept as packed uint32 codes.
 
@@ -101,6 +122,8 @@ def ternary_gemv(
         ``uint32`` codes ``[N, K/16]``.
     row_alpha:
         Per-output-row scale ``[N]``.
+    rms_weight:
+        If set, RMSNorm ``x`` in-kernel (fused input RMSNorm + GEMV).
     """
     if not x.is_cuda or not packed_weight.is_cuda or not row_alpha.is_cuda:
         raise RuntimeError("ternary_gemv requires CUDA tensors (packed weights stay on GPU).")
@@ -129,15 +152,19 @@ def ternary_gemv(
     batch = int(x.numel() // k_in)
     x_mat = x.reshape(batch, k_in)
     y = torch.empty(batch, n_out, device=x.device, dtype=x.dtype)
+    has_rms = rms_weight is not None
+    rms_w = x_mat if rms_weight is None else rms_weight.reshape(-1)
+    if has_rms and rms_w.numel() != k_in:
+        raise ValueError(f"rms_weight has {rms_w.numel()} elements, expected {k_in}.")
 
-    def _grid(meta):
-        return (triton.cdiv(n_out, meta["BLOCK_N"]), batch)
-
-    _ternary_gemv_kernel[_grid](
+    block_n, block_k_words, num_warps, num_stages = _gemv_launch_meta(nwords, batch)
+    grid = (triton.cdiv(n_out, block_n), batch)
+    _ternary_gemv_kernel[grid](
         x_mat,
         packed_weight,
         alpha,
         y,
+        rms_w,
         n_out,
         nwords,
         x_mat.stride(0),
@@ -147,5 +174,11 @@ def ternary_gemv(
         alpha.stride(0),
         y.stride(0),
         y.stride(1),
+        float(rms_eps),
+        HAS_RMS=has_rms,
+        BLOCK_N=block_n,
+        BLOCK_K_WORDS=block_k_words,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return y.reshape(*leading, n_out)

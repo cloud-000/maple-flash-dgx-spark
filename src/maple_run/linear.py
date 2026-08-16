@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from maple_run.kernels.rtn4 import rtn4_embedding, rtn4_gemv
-from maple_run.kernels.ternary_expert import ternary_expert_gemv
+from maple_run.kernels.ternary_expert import (
+    ternary_expert_down_sum,
+    ternary_expert_gemv,
+    ternary_expert_swiglu,
+)
 from maple_run.kernels.ternary_gemv import ternary_gemv
 from maple_run.pack import HEAD_GROUP_SIZE
 
@@ -13,8 +17,14 @@ class PackedTernaryLinear:
         self.packed_weight = packed_weight
         self.row_alpha = row_alpha
 
-    def forward(self, x):
-        return ternary_gemv(x, self.packed_weight, self.row_alpha)
+    def forward(self, x, rms_weight=None, rms_eps: float = 1e-6):
+        return ternary_gemv(
+            x,
+            self.packed_weight,
+            self.row_alpha,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+        )
 
     __call__ = forward
 
@@ -28,6 +38,19 @@ class PackedTernaryExperts:
 
     def forward(self, x, expert_ids):
         return ternary_expert_gemv(x, self.packed_weight, self.row_alpha, expert_ids)
+
+    def swiglu(self, x, expert_ids):
+        return ternary_expert_swiglu(x, self.packed_weight, self.row_alpha, expert_ids)
+
+    def down_sum(self, x, expert_ids, topk_weight, residual=None):
+        return ternary_expert_down_sum(
+            x,
+            self.packed_weight,
+            self.row_alpha,
+            expert_ids,
+            topk_weight,
+            residual=residual,
+        )
 
     __call__ = forward
 

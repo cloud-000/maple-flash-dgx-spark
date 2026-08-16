@@ -45,7 +45,7 @@ def generate(model_dir: str, prompt: str, max_tokens: int = 128) -> str:
         flush=True,
     )
 
-    cache = model.make_cache()
+    cache = model.make_cache(max_len=prompt_len + max_tokens)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.inference_mode():
@@ -54,13 +54,21 @@ def generate(model_dir: str, prompt: str, max_tokens: int = 128) -> str:
         t_prefill = time.perf_counter()
         eos = model.eos_token_id
         new_tokens: list[int] = []
-        for _ in range(max_tokens):
-            next_id = int(logits[0, -1].argmax().item())
+        pinned = torch.empty((), dtype=torch.long, pin_memory=True)
+        eos_ready = torch.cuda.Event()
+        for i in range(max_tokens):
+            next_t = logits[0, -1].argmax()
+            pinned.copy_(next_t, non_blocking=True)
+            eos_ready.record()
+            if i + 1 < max_tokens:
+                logits = model.forward(
+                    next_t.view(1, 1), cache=cache, logits_to_keep=1
+                )
+            eos_ready.synchronize()
+            next_id = int(pinned.item())
             new_tokens.append(next_id)
             if eos is not None and next_id == int(eos):
                 break
-            nxt = torch.tensor([[next_id]], device=model.device, dtype=torch.long)
-            logits = model.forward(nxt, cache=cache, logits_to_keep=1)
         torch.cuda.synchronize()
         t_end = time.perf_counter()
 
