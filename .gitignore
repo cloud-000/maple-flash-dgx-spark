@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local checkpoints and conversion output
+checkpoints/
+data/
+*.safetensors
+!docs/sources/**
+
+# Hugging Face / caches copied into the repo
+.cache/
+_src/
+.pytest_cache/
+
+# docs
+docs/sources/

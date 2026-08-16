@@ -1,0 +1,34 @@
+[project]
+name = "maple-run"
+version = "0.1.0"
+description = "Packed ternary CUDA runtime for DeepGrove Maple-Preview on DGX Spark"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "safetensors>=0.5.0",
+    "huggingface-hub>=0.30.0",
+    "numpy>=2.0.0",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "torch",
+    "triton",
+]
+tokenizer = [
+    "transformers>=4.57.0",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+maple-run = "maple_run.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+# Spark is aarch64 + CUDA. Do not uv-add a generic torch wheel until the
+# implementer confirms the host's existing PyTorch/CUDA stack. See AGENTS.md.
