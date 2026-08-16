@@ -4,11 +4,11 @@ This document is for the **next session**. The previous session diagnosed why
 `vllm serve deepgrove/maple-preview` failed on Spark, why the Hugging Face CUDA
 Transformers path is slow, and what a packed-kernel runtime has to do.
 
-**Phase 1 (CPU pack + convert) and phase 2 (packed GEMV kernel) are done.**
-Next session starts at **phase 3** (Maple forward + fused expert dispatch).
-Do not re-convert unless the packed checkpoint is missing. Do not start with a
-web search for Maple, MLX, or Spark bandwidth; read `docs/SOURCES.md` and
-`AGENTS.md` first.
+**Phase 1 (CPU pack), phase 2 (packed GEMV), and phase 3 (Maple forward +
+fused expert dispatch) are done.** Next session starts at **phase 4**
+(FlashHead). Do not re-convert unless the packed checkpoint is missing. Do not
+start with a web search for Maple, MLX, or Spark bandwidth; read
+`docs/SOURCES.md` and `AGENTS.md` first.
 
 ## Status (2026-08-16)
 
@@ -16,7 +16,7 @@ web search for Maple, MLX, or Spark bandwidth; read `docs/SOURCES.md` and
 |---|---|
 | 1 Pack / convert | **Done.** NumPy `ternarize` / `pack_2bit` / 4-bit RTN; streaming converter; tests in `tests/test_pack.py` and `tests/test_convert.py`. |
 | 2 Packed GEMV kernel | **Done.** Triton packed GEMV in `maple_run/kernels/ternary_gemv.py`; never unpacks to dense bf16. Tests in `tests/test_ternary_gemv.py`. |
-| 3 Model decode | Not started (`maple_run/model.py` is still a stub). |
+| 3 Model decode | **Done.** Packed `MapleForCausalLM`, fused expert GEMV, 4-bit RTN embed/head, torch SDPA. Greedy generate works. |
 | 4 FlashHead | Not started |
 | 5 HTTP | Not started |
 
@@ -219,16 +219,34 @@ local_files_only=True)`); shards are read in place.
 `[1, K]` or `[B, K]`, `W` packed uint32, scale by `row_alpha`. Triton on this
 host (GB10 sm_121, torch 2.13.0+cu130). Correctness vs dequantized `F.linear`
 in fp32; the kernel does not materialize a dense bf16 `W`.
-`PackedTernaryLinear.forward` calls it. 3-D stacked experts are phase 3.
+`PackedTernaryLinear.forward` calls it. 3-D stacked experts use
+`ternary_expert_gemv` (phase 3).
 
-### Phase 3 — model decode
+### Phase 3 — model decode — **done**
 
-Wire `PackedTernaryLinear` into a Maple forward. Fused expert dispatch (grouped
-GEMM / packed expert kernel), not 256 Python launches. Tokenizer from the HF
-repo (`transformers` optional extra). Attention on activations: torch SDPA or
-FlashInfer; do not add Dao `flash_attn` to the vLLM image.
+`maple_run/model.py` loads `checkpoints/maple-2bit` onto CUDA, keeps ternary
+weights as uint32 + `row_alpha`, and runs:
 
-Measure tok/s and bytes/token vs the ~2.3 GB/token unpacked estimate.
+- `PackedTernaryLinear` for fused QKV / O
+- `ternary_expert_gemv` over the selected top-8 experts (one launch, 3-D stacked
+  `switch_mlp`; no 256-expert Python loop, no `tokens_per_expert.cpu()`)
+- torch SDPA (`enable_gqa=True`); sliding-window 512 vs NoPE global layers;
+  QK RMSNorm; partial RoPE 0.5
+- 4-bit RTN embedding gather + `rtn4_gemv` exact `lm_head` (FlashHead is phase 4)
+- Chat-template greedy generate: `uv run maple-run generate --model checkpoints/maple-2bit --prompt "..." --max-tokens 128`
+
+Measured on this GB10 host (2026-08-16), exact 4-bit head, no FlashHead:
+
+| | |
+|---|---|
+| Packed weight traffic | **462 MB/token** |
+| Unpacked bf16 traffic (same active tensors) | **2384 MB/token** (~2.3 GB handoff estimate) |
+| Decode | **~90 tok/s** greedy (`The capital of France is` → think-trace then `Paris`) |
+| Prefill | ~4–5 tok/s on first launch (Triton autotune charged here) |
+
+M4 exact-head baseline is 169 tok/s; FlashHead is the 169→218 jump. Spark
+bandwidth ceiling at 462 MB/token is `273/0.462 ≈ 590` tok/s if kernels were
+fully fused. Phase 4 is FlashHead, not a vLLM detour.
 
 ### Phase 4 — FlashHead (optional)
 
@@ -247,9 +265,11 @@ Only after packed decode works. Do not start here.
 | `src/maple_run/pack.py` | CPU ternarize + pack_2bit + 4-bit RTN |
 | `src/maple_run/convert.py` | Streaming HF → packed safetensors |
 | `src/maple_run/kernels/ternary_gemv.py` | Packed GEMV (Triton) |
-| `src/maple_run/linear.py` | PackedTernaryLinear → ternary_gemv |
-| `src/maple_run/model.py` | MapleForCausalLM (stub) |
-| `src/maple_run/generate.py` | Generate helper (stub) |
+| `src/maple_run/kernels/ternary_expert.py` | Fused indexed expert GEMV |
+| `src/maple_run/kernels/rtn4.py` | 4-bit RTN embedding + lm_head GEMV |
+| `src/maple_run/linear.py` | PackedTernaryLinear / Experts / RTN4 |
+| `src/maple_run/model.py` | MapleForCausalLM packed forward |
+| `src/maple_run/generate.py` | Tokenizer + greedy decode + tok/s |
 | `docs/sources/mlx_lm_ternary.py` | **Authoritative packer** (DeepGrove, MIT) |
 | `docs/sources/mlx_lm_deepgrove_README.md` | MLX runtime README |
 | `docs/sources/maple-preview-config.json` | HF `config.json` copy |

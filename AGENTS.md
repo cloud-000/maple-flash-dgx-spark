@@ -19,8 +19,9 @@ hardware numbers. Vendored algorithm source is `docs/sources/mlx_lm_ternary.py`.
    checkpoint lives at `checkpoints/maple-2bit` (gitignored).
 2. **Kernels** (`maple_run/kernels/ternary_gemv.py`): **done.** Packed GEMV that
    never unpacks to a dense bf16 matrix.
-3. **Model** (`maple_run/model.py`): Maple forward with packed linears, fused
-   expert dispatch, then decode. FlashHead is later. **Start here.**
+3. **Model** (`maple_run/model.py`): **done.** Packed Maple forward, fused expert
+   dispatch, SDPA attention, greedy decode.
+4. **FlashHead** (`maple_run/generate.py` / head clustering): **Start here.**
 
 Stop at the phase the user asked for. Do not skip packing tests to jump to a
 server.
