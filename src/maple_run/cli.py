@@ -40,20 +40,20 @@ def main(argv: list[str] | None = None) -> int:
     generate.add_argument(
         "--temperature",
         type=float,
-        default=0.0,
-        help="Softmax temperature. 0 (default) is greedy argmax",
+        default=1.0,
+        help="Softmax temperature (default 1.0). 0 is greedy argmax",
     )
     generate.add_argument(
         "--top-p",
         type=float,
-        default=1.0,
-        help="Nucleus sampling cutoff after top-k. 1 (default) disables",
+        default=0.95,
+        help="Nucleus sampling cutoff after top-k (default 0.95)",
     )
     generate.add_argument(
         "--top-k",
         type=int,
-        default=0,
-        help="Keep the top-k softmax tokens before nucleus. 0 disables; 1 is greedy",
+        default=20,
+        help="Keep the top-k softmax tokens before nucleus (default 20). 1 is greedy",
     )
     generate.add_argument(
         "--seed",

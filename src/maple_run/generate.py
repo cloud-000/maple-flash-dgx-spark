@@ -4,9 +4,32 @@ from __future__ import annotations
 
 import time
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+
+# CLI / generate defaults. T=0 or top-k=1 is still greedy argmax.
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_TOP_P = 0.95
+DEFAULT_TOP_K = 20
+
+
+@dataclass
+class GenerateResult:
+    text: str
+    prompt_len: int
+    n_new: int
+    prefill_s: float
+    decode_s: float
+
+    @property
+    def decode_tok_s(self) -> float:
+        return self.n_new / self.decode_s if self.decode_s > 0 else 0.0
+
+    @property
+    def prefill_tok_s(self) -> float:
+        return self.prompt_len / self.prefill_s if self.prefill_s > 0 else 0.0
 
 
 def is_greedy(temperature: float, top_k: int) -> bool:
@@ -60,11 +83,11 @@ def generate(
     model_dir: str,
     prompt: str,
     max_tokens: int = 128,
-    temperature: float = 0.0,
-    top_p: float = 1.0,
-    top_k: int = 0,
+    temperature: float = DEFAULT_TEMPERATURE,
+    top_p: float = DEFAULT_TOP_P,
+    top_k: int = DEFAULT_TOP_K,
     seed: int | None = None,
-) -> str:
+) -> GenerateResult:
     """Load a packed checkpoint, decode, print text and tok/s."""
     from transformers import AutoTokenizer
 
@@ -177,4 +200,10 @@ def generate(
 
     text = tokenizer.decode(new_tokens, skip_special_tokens=True)
     print(text, flush=True)
-    return text
+    return GenerateResult(
+        text=text,
+        prompt_len=prompt_len,
+        n_new=n_new,
+        prefill_s=prefill_s,
+        decode_s=decode_s,
+    )

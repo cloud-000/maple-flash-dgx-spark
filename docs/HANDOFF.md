@@ -232,7 +232,18 @@ weights as uint32 + `row_alpha`, and runs:
 - Decode: fused input-RMS into QKV, fused add+RMSNorm, fused expert SwiGLU,
   preallocated KV, Triton GQA for `q_len=1`; prefill still torch SDPA
 - 4-bit RTN embedding gather + `rtn4_gemv` exact `lm_head` (FlashHead is phase 4)
-- Chat-template **greedy** generate: `uv run maple-run generate --model checkpoints/maple-2bit --prompt "..." --max-tokens 128`
+- Chat-template generate. CLI defaults are sampled: `--temperature 1.0 --top-p 0.95 --top-k 20`. Greedy is `--temperature 0`.
+
+Speed command (do not use greedy France for tok/s):
+
+```bash
+uv run maple-run generate --model checkpoints/maple-2bit \
+  --prompt "Write a haiku on groves" --max-tokens 700
+```
+
+Or `uv run pytest tests/test_bench.py --bench -s`. Greedy `--temperature 0` / France
+`--max-tokens 128` is only a correctness check (should EOS at Paris). Argmax skips
+softmax/top-k/nucleus/multinomial and often stops at ~38 tok, which inflates tok/s.
 
 Measured on this GB10 host (2026-08-16), exact 4-bit head, no FlashHead:
 
@@ -242,10 +253,10 @@ Measured on this GB10 host (2026-08-16), exact 4-bit head, no FlashHead:
 | Unpacked bf16 traffic (same active tensors) | **2384 MB/token** (~2.3 GB handoff estimate) |
 | Bandwidth ceiling | `273 / 0.462 ≈ 590` tok/s if fully fused |
 | M4-scaled target (no FlashHead) | `169 × 273 / 120 ≈ 386` tok/s |
-| Decode (38 tok EOS, France prompt) | **~90 tok/s → ~144 tok/s** after body fusion |
-| Decode (700 tok, haiku prompt, hit max) | **~171 tok/s** |
+| Decode **sampled** T=1.0 top-p=0.95 top-k=20 (haiku, 731 tok EOS) | **~166 tok/s** |
+| Decode greedy France 38 tok EOS (not a speed bench) | ~209 tok/s |
+| Decode greedy haiku 700 tok cap (not a speed bench) | ~171–194 tok/s |
 | Isolated `forward` / CUDA-graph replay | ~206 / ~244 tok/s (graphs not used in CLI; capture hurt short runs) |
-| Prefill | ~12 tok/s (autotune no longer charged on body GEMV) |
 
 Body decode GEMV was ~51 GB/s because Triton autotune, keyed only on `N`,
 learned fat `BLOCK_N` from prefill and idled GB10’s 48 SMs. Pinned decode
@@ -262,21 +273,17 @@ tok/s did not scale with 273 vs 120 GB/s.
    decode attention that does not loop the full preallocated `MAX_LEN` every
    token (this gets worse as `--max-tokens` grows), fewer launches / CUDA
    graphs that help long runs without poisoning short EOS timings, body GEMV
-   closer to peak. Measure with the France 128-token command **and** a long
-   run (`--max-tokens 700` or 3000).
-2. **Greedy think-trace loops.**
-   `generate --prompt "Write a haiku on groves" --max-tokens 700` (and 3000)
-   hit the token cap and stuck recounting syllables (`"Shadows dance through
-   the grove" is 6.`). This is greedy argmax + Maple’s think-trace, not a
-   demonstrated KV-cache stutter: no temperature/top-p, no repetition penalty,
-   and no EOS so it runs to `max_tokens`. Sampling is still out of scope
-   unless asked. If quality regresses vs the ~90 tok/s greedy baseline on
-   short prompts, check decode-attn window masking / `seqlen` before adding
-   samplers.
+   closer to peak. **Measure tok/s with sampled decode** (`--temperature 1.0
+   --top-p 0.95 --top-k 20`), not greedy France.
+2. **Greedy think-trace loops.** Sampling is in `generate.py` (`--temperature`,
+   `--top-p`, `--top-k`, `--seed`). Greedy haiku `--max-tokens 700` still hits
+   the cap recounting syllables; sampled T=1.0/top-p=0.95/top-k=20 produced a
+   finished haiku (731 tok EOS at ~166 tok/s). France T=0 remains the greedy
+   correctness check.
 
 CUDA graph replay is ~244 tok/s in isolation; capturing inside a 38-token
-EOS-timed loop dropped CLI tok/s. Only use graphs if long-run timing improves
-and short-run France numbers do not regress.
+EOS-timed loop dropped CLI tok/s. Only use graphs if long-run **sampled**
+timing improves.
 
 ### Phase 4 — FlashHead (optional)
 
@@ -301,7 +308,8 @@ Only after packed decode works. Do not start here.
 | `src/maple_run/kernels/rtn4.py` | 4-bit RTN embedding + lm_head GEMV |
 | `src/maple_run/linear.py` | PackedTernaryLinear / Experts / RTN4 |
 | `src/maple_run/model.py` | MapleForCausalLM packed forward |
-| `src/maple_run/generate.py` | Tokenizer + greedy decode + tok/s |
+| `src/maple_run/generate.py` | Tokenizer + greedy/sampled decode + tok/s |
+| `tests/test_bench.py` | Sampled decode speed (`pytest --bench`) |
 | `docs/sources/mlx_lm_ternary.py` | **Authoritative packer** (DeepGrove, MIT) |
 | `docs/sources/mlx_lm_deepgrove_README.md` | MLX runtime README |
 | `docs/sources/maple-preview-config.json` | HF `config.json` copy |

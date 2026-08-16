@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from maple_run.cli import main
-from maple_run.generate import is_greedy, sample_next
+from maple_run.generate import (
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
+    generate,
+    is_greedy,
+    sample_next,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -90,6 +99,26 @@ def test_cli_rejects_bad_sampling_args():
         main(["generate", "--model", "x", "--prompt", "y", "--top-p", "1.5"])
     with pytest.raises(SystemExit):
         main(["generate", "--model", "x", "--prompt", "y", "--top-k", "-2"])
+
+
+def test_generate_defaults_are_sampled():
+    assert DEFAULT_TEMPERATURE == 1.0
+    assert DEFAULT_TOP_P == 0.95
+    assert DEFAULT_TOP_K == 20
+    sig = inspect.signature(generate)
+    assert sig.parameters["temperature"].default == DEFAULT_TEMPERATURE
+    assert sig.parameters["top_p"].default == DEFAULT_TOP_P
+    assert sig.parameters["top_k"].default == DEFAULT_TOP_K
+
+
+def test_cli_help_lists_sampling_defaults(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["generate", "--help"])
+    assert exc.value.code == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "default 1.0" in out
+    assert "default 0.95" in out
+    assert "default 20" in out
 
 
 @cuda
