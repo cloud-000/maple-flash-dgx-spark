@@ -9,8 +9,63 @@ from pathlib import Path
 import torch
 
 
-def generate(model_dir: str, prompt: str, max_tokens: int = 128) -> str:
-    """Load a packed checkpoint, greedy-decode, print text and tok/s."""
+def is_greedy(temperature: float, top_k: int) -> bool:
+    """True when the next token must be argmax (no multinomial)."""
+    return temperature <= 0.0 or top_k == 1
+
+
+def _nucleus(probs: torch.Tensor, top_p: float) -> torch.Tensor:
+    """Zero probability mass outside the nucleus. ``probs`` is 1-D."""
+    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+    cumsum = torch.cumsum(sorted_probs, dim=-1)
+    remove = cumsum > top_p
+    remove[1:] = remove[:-1].clone()
+    remove[0] = False
+    sorted_probs = sorted_probs.masked_fill(remove, 0)
+    return torch.zeros_like(probs).scatter_(0, sorted_idx, sorted_probs)
+
+
+def sample_next(
+    logits: torch.Tensor,
+    *,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Pick the next token from 1-D vocab logits. Stays on-device.
+
+    Greedy ``argmax`` when ``temperature <= 0`` or ``top_k == 1``. Otherwise:
+    temperature softmax, then top-k, then nucleus top-p, then multinomial.
+    """
+    if is_greedy(temperature, top_k):
+        return logits.argmax()
+
+    probs = torch.softmax(logits.float().div(temperature), dim=-1)
+    vocab = probs.shape[-1]
+    if top_k > 0 and top_k < vocab:
+        probs, idx = torch.topk(probs, int(top_k), dim=-1)
+    else:
+        idx = None
+    if 0.0 < top_p < 1.0:
+        probs = _nucleus(probs, float(top_p))
+    probs = probs / probs.sum().clamp_min(1e-12)
+    nxt = torch.multinomial(probs, num_samples=1, generator=generator)
+    if idx is not None:
+        nxt = idx[nxt]
+    return nxt.reshape(())
+
+
+def generate(
+    model_dir: str,
+    prompt: str,
+    max_tokens: int = 128,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    seed: int | None = None,
+) -> str:
+    """Load a packed checkpoint, decode, print text and tok/s."""
     from transformers import AutoTokenizer
 
     from maple_run.model import MapleForCausalLM
@@ -54,6 +109,18 @@ def generate(model_dir: str, prompt: str, max_tokens: int = 128) -> str:
         )
         torch.cuda.synchronize()
 
+    greedy = is_greedy(temperature, top_k)
+    generator = None
+    if seed is not None and not greedy:
+        generator = torch.Generator(device=model.device)
+        generator.manual_seed(int(seed))
+    if not greedy:
+        print(
+            f"Sampling: temperature={temperature} top_p={top_p} "
+            f"top_k={top_k} seed={seed}",
+            flush=True,
+        )
+
     cache = model.make_cache(max_len=prompt_len + max_tokens)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -66,7 +133,18 @@ def generate(model_dir: str, prompt: str, max_tokens: int = 128) -> str:
         pinned = torch.empty((), dtype=torch.long, pin_memory=True)
         eos_ready = torch.cuda.Event()
         for i in range(max_tokens):
-            next_t = logits[0, -1].argmax()
+            last = logits[0, -1]
+            next_t = (
+                last.argmax()
+                if greedy
+                else sample_next(
+                    last,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    generator=generator,
+                )
+            )
             pinned.copy_(next_t, non_blocking=True)
             eos_ready.record()
             if i + 1 < max_tokens:

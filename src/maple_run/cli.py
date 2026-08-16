@@ -37,6 +37,30 @@ def main(argv: list[str] | None = None) -> int:
     generate.add_argument("--model", required=True, help="Packed checkpoint directory")
     generate.add_argument("--prompt", required=True)
     generate.add_argument("--max-tokens", type=int, default=128)
+    generate.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Softmax temperature. 0 (default) is greedy argmax",
+    )
+    generate.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling cutoff after top-k. 1 (default) disables",
+    )
+    generate.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help="Keep the top-k softmax tokens before nucleus. 0 disables; 1 is greedy",
+    )
+    generate.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="CUDA generator seed for sampling (ignored when greedy)",
+    )
 
     args = parser.parse_args(argv)
     if args.cmd == "convert":
@@ -47,9 +71,23 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.cmd == "generate":
+        if args.temperature < 0:
+            parser.error("--temperature must be >= 0")
+        if args.top_p <= 0 or args.top_p > 1:
+            parser.error("--top-p must be in (0, 1]")
+        if args.top_k < 0:
+            parser.error("--top-k must be >= 0")
         from maple_run.generate import generate
 
-        generate(args.model, args.prompt, max_tokens=args.max_tokens)
+        generate(
+            args.model,
+            args.prompt,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            seed=args.seed,
+        )
         return 0
     parser.error(f"unknown command {args.cmd}")
     return 2
