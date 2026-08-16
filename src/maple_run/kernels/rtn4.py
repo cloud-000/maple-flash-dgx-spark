@@ -50,17 +50,18 @@ def rtn4_embedding(
 def _rtn4_launch_meta(nwords: int, batch: int) -> tuple[int, int, int, int]:
     """BLOCK_N, BLOCK_K_WORDS, warps, stages.
 
-    One K-tile is one RTN group (8 uint32 = 64 codes) so scale/bias are scalars
-    per output row, not a ``[BLOCK_N, BLOCK_K]`` load. Decode (batch=1) uses
-    skinny ``BLOCK_N`` so GB10's 48 SMs stay busy on the 152k-row lm_head.
+    ``BLOCK_K_WORDS`` is a multiple of 8 so each K-tile holds a whole number of
+    RTN groups (8 uint32 = 64 codes). Decode (batch=1) uses fat K tiles; one
+    group per tile was ~140 GB/s on the lm_head, four groups with per-group
+    scale/bias ~201 GB/s.
     """
-    # 8 words × 8 codes/word = 64 = HEAD_GROUP_SIZE.
-    block_k_words = 8
     if batch == 1:
-        # lm_head N=152k: fat BLOCK_N still leaves thousands of CTAs; 2 warps
-        # raises occupancy vs 4-warp tiles (1.36 ms / ~143 GB/s on GB10).
-        return 64, block_k_words, 2, 2
-    return 32, block_k_words, 4, 3
+        if nwords >= 32:
+            return 32, 32, 2, 2
+        if nwords >= 16:
+            return 32, 16, 2, 3
+        return 64, 8, 2, 2
+    return 32, 8, 4, 3
 
 
 @triton.jit
@@ -95,8 +96,10 @@ def _rtn4_gemv_kernel(
     x_row = x_ptr + pid_b * stride_xb
 
     BLOCK_K: tl.constexpr = BLOCK_K_WORDS * 8
+    N_GROUPS_TILE: tl.constexpr = BLOCK_K // GROUP_SIZE
     shifts = (tl.arange(0, 8) * 4).to(tl.uint32)
     k_total = nwords * 8
+    n_groups = k_total // GROUP_SIZE
 
     for w0 in range(0, nwords, BLOCK_K_WORDS):
         offs_w = w0 + tl.arange(0, BLOCK_K_WORDS)
@@ -116,19 +119,22 @@ def _rtn4_gemv_kernel(
             mask=mask_k,
             other=0.0,
         ).to(tl.float32)
-        # Tile is one RTN group: one scale/bias per output row, not per K.
-        group = (w0 * 8) // GROUP_SIZE
+        offs_g = (w0 * 8) // GROUP_SIZE + tl.arange(0, N_GROUPS_TILE)
+        mask_g = offs_g < n_groups
         scale = tl.load(
-            scale_ptr + offs_n * stride_sn + group * stride_sg,
-            mask=mask_n,
+            scale_ptr + offs_n[:, None] * stride_sn + offs_g[None, :] * stride_sg,
+            mask=mask_n[:, None] & mask_g[None, :],
             other=0.0,
         ).to(tl.float32)
         bias = tl.load(
-            bias_ptr + offs_n * stride_bn + group * stride_bg,
-            mask=mask_n,
+            bias_ptr + offs_n[:, None] * stride_bn + offs_g[None, :] * stride_bg,
+            mask=mask_n[:, None] & mask_g[None, :],
             other=0.0,
         ).to(tl.float32)
-        acc += scale * tl.sum(q * x_tile[None, :], axis=1) + bias * tl.sum(x_tile, axis=0)
+        ones = tl.full((GROUP_SIZE,), 1.0, dtype=tl.float32)
+        scale_k = tl.reshape(scale[:, :, None] * ones[None, None, :], (BLOCK_N, BLOCK_K))
+        bias_k = tl.reshape(bias[:, :, None] * ones[None, None, :], (BLOCK_N, BLOCK_K))
+        acc += tl.sum((scale_k * q + bias_k) * x_tile[None, :], axis=1)
 
     tl.store(
         y_ptr + pid_b * stride_yb + offs_n * stride_yn,
@@ -199,6 +205,11 @@ def rtn4_gemv(
     y = torch.empty(batch, n_out, device=x.device, dtype=x.dtype)
 
     block_n, block_k_words, num_warps, num_stages = _rtn4_launch_meta(nwords, batch)
+    if (block_k_words * _CODES_PER_WORD) % group_size != 0:
+        raise ValueError(
+            f"BLOCK_K_WORDS={block_k_words} is not a whole number of RTN groups "
+            f"(group_size={group_size})."
+        )
     grid = (triton.cdiv(n_out, block_n), batch)
     _rtn4_gemv_kernel[grid](
         x_mat,

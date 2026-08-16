@@ -152,6 +152,46 @@ def test_tiny_forward_and_generate_shapes():
 
 
 @cuda
+def test_tiny_decode_graph_matches_eager_ids():
+    from maple_run.generate import _try_decode_graph
+    from maple_run.model import MapleForCausalLM
+
+    cfg = _tiny_config()
+    rng = np.random.default_rng(5)
+    weights = _tiny_weights(cfg, rng)
+    model = MapleForCausalLM.from_weight_dict(cfg, weights, device="cuda")
+    ids = torch.randint(0, cfg["vocab_size"], (1, 4), device="cuda")
+    cache = model.make_cache(max_len=32)
+    with torch.inference_mode():
+        logits = model.forward(ids, cache=cache, logits_to_keep=1)
+        g = torch.Generator(device="cuda")
+        g.manual_seed(0)
+        captured = _try_decode_graph(
+            model,
+            cache,
+            logits,
+            greedy=False,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=8,
+            generator=g,
+        )
+    assert captured is not None
+    with torch.inference_mode():
+        unseeded = _try_decode_graph(
+            model,
+            cache,
+            logits,
+            greedy=False,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=8,
+            generator=None,
+        )
+    assert unseeded is not None
+
+
+@cuda
 def test_moe_matches_selected_expert_linears():
     from maple_run.kernels.ternary_gemv import ternary_gemv
     from maple_run.linear import PackedTernaryExperts

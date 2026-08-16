@@ -59,24 +59,199 @@ def sample_next(
     """Pick the next token from 1-D vocab logits. Stays on-device.
 
     Greedy ``argmax`` when ``temperature <= 0`` or ``top_k == 1``. Otherwise:
-    temperature softmax, then top-k, then nucleus top-p, then multinomial.
+    top-k on logits, temperature softmax, nucleus top-p, then multinomial.
+    Top-k before softmax skips a full-vocab softmax on the 152k lm_head.
     """
     if is_greedy(temperature, top_k):
         return logits.argmax()
 
-    probs = torch.softmax(logits.float().div(temperature), dim=-1)
-    vocab = probs.shape[-1]
+    idx = None
+    x = logits
+    vocab = x.shape[-1]
     if top_k > 0 and top_k < vocab:
-        probs, idx = torch.topk(probs, int(top_k), dim=-1)
-    else:
-        idx = None
+        x, idx = torch.topk(x, int(top_k), dim=-1)
+    probs = torch.softmax(x.float().div(temperature), dim=-1)
     if 0.0 < top_p < 1.0:
         probs = _nucleus(probs, float(top_p))
-    probs = probs / probs.sum().clamp_min(1e-12)
+        probs = probs / probs.sum().clamp_min(1e-12)
     nxt = torch.multinomial(probs, num_samples=1, generator=generator)
     if idx is not None:
         nxt = idx[nxt]
     return nxt.reshape(())
+
+
+_GRAPH_WARMUP = 3
+_GRAPH_CHECK_TOKENS = 8
+
+
+@dataclass
+class _DecodeGraph:
+    graph: torch.cuda.CUDAGraph
+    token_ids: torch.Tensor
+    logits: torch.Tensor
+
+
+def _next_token(
+    logits: torch.Tensor,
+    *,
+    greedy: bool,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    generator: torch.Generator | None,
+) -> torch.Tensor:
+    last = logits[0, -1]
+    if greedy:
+        return last.argmax()
+    return sample_next(
+        last,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        generator=generator,
+    )
+
+
+def _capture_decode_graph(model, cache, token_ids: torch.Tensor) -> _DecodeGraph:
+    """Capture ``forward(token_ids)`` on ``cache``. Caller restores KV afterwards."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    logits = None
+    with torch.cuda.stream(stream):
+        for _ in range(_GRAPH_WARMUP):
+            logits = model.forward(token_ids, cache=cache, logits_to_keep=1)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            logits = model.forward(token_ids, cache=cache, logits_to_keep=1)
+    torch.cuda.current_stream().wait_stream(stream)
+    if logits is None:
+        raise RuntimeError("CUDA graph capture did not produce logits.")
+    return _DecodeGraph(graph=graph, token_ids=token_ids, logits=logits)
+
+
+def _decode_n(
+    *,
+    n: int,
+    logits: torch.Tensor,
+    replay,
+    greedy: bool,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    generator: torch.Generator | None,
+    eos,
+) -> list[int]:
+    ids: list[int] = []
+    for i in range(n):
+        next_t = _next_token(
+            logits,
+            greedy=greedy,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            generator=generator,
+        )
+        ids.append(int(next_t.item()))
+        if eos is not None and ids[-1] == int(eos):
+            break
+        if i + 1 < n:
+            logits = replay(next_t)
+    return ids
+
+
+def _cuda_rng(device: torch.device) -> torch.Generator:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    return torch.cuda.default_generators[idx]
+
+
+def _rng_snapshot(device: torch.device, generator: torch.Generator | None):
+    default = _cuda_rng(device).get_state()
+    extra = generator.get_state() if generator is not None else None
+    return default, extra
+
+
+def _rng_restore(
+    device: torch.device,
+    snap: tuple[torch.Tensor, torch.Tensor | None],
+    generator: torch.Generator | None,
+) -> None:
+    default, extra = snap
+    _cuda_rng(device).set_state(default)
+    if generator is not None and extra is not None:
+        generator.set_state(extra)
+
+
+def _try_decode_graph(
+    model,
+    cache,
+    prefill_logits: torch.Tensor,
+    *,
+    greedy: bool,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    generator: torch.Generator | None,
+) -> _DecodeGraph | None:
+    """Capture a decode graph; keep it only if replay matches eager token ids."""
+    snap = cache.snapshot()
+    token_ids = torch.zeros(1, 1, dtype=torch.long, device=model.device)
+    try:
+        captured = _capture_decode_graph(model, cache, token_ids)
+    except Exception as exc:
+        cache.restore(snap)
+        print(f"CUDA graph capture failed ({exc}); using eager decode", flush=True)
+        return None
+    cache.restore(snap)
+
+    n_check = _GRAPH_CHECK_TOKENS
+    rng_state = _rng_snapshot(model.device, generator)
+    eos = model.eos_token_id
+
+    def eager_replay(next_t: torch.Tensor) -> torch.Tensor:
+        return model.forward(next_t.view(1, 1), cache=cache, logits_to_keep=1)
+
+    def graph_replay(next_t: torch.Tensor) -> torch.Tensor:
+        captured.token_ids.copy_(next_t.view(1, 1))
+        captured.graph.replay()
+        return captured.logits
+
+    eager_ids = _decode_n(
+        n=n_check,
+        logits=prefill_logits,
+        replay=eager_replay,
+        greedy=greedy,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        generator=generator,
+        eos=eos,
+    )
+    cache.restore(snap)
+    _rng_restore(model.device, rng_state, generator)
+
+    graph_ids = _decode_n(
+        n=n_check,
+        logits=prefill_logits,
+        replay=graph_replay,
+        greedy=greedy,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        generator=generator,
+        eos=eos,
+    )
+    cache.restore(snap)
+    _rng_restore(model.device, rng_state, generator)
+
+    if eager_ids != graph_ids:
+        print(
+            f"CUDA graph replay diverged (eager {eager_ids[:8]} vs graph "
+            f"{graph_ids[:8]}); using eager decode",
+            flush=True,
+        )
+        return None
+    print("CUDA graph decode: replay matches eager sampled ids", flush=True)
+    return captured
 
 
 def generate(
@@ -151,29 +326,44 @@ def generate(
         logits = model.forward(input_ids, cache=cache, logits_to_keep=1)
         torch.cuda.synchronize()
         t_prefill = time.perf_counter()
+        graph = None
+        if max_tokens > 1:
+            graph = _try_decode_graph(
+                model,
+                cache,
+                logits,
+                greedy=greedy,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                generator=generator,
+            )
+            torch.cuda.synchronize()
+        t_decode = time.perf_counter()
         eos = model.eos_token_id
         new_tokens: list[int] = []
         pinned = torch.empty((), dtype=torch.long, pin_memory=True)
         eos_ready = torch.cuda.Event()
         for i in range(max_tokens):
-            last = logits[0, -1]
-            next_t = (
-                last.argmax()
-                if greedy
-                else sample_next(
-                    last,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    generator=generator,
-                )
+            next_t = _next_token(
+                logits,
+                greedy=greedy,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                generator=generator,
             )
             pinned.copy_(next_t, non_blocking=True)
             eos_ready.record()
             if i + 1 < max_tokens:
-                logits = model.forward(
-                    next_t.view(1, 1), cache=cache, logits_to_keep=1
-                )
+                if graph is not None:
+                    graph.token_ids.copy_(next_t.view(1, 1))
+                    graph.graph.replay()
+                    logits = graph.logits
+                else:
+                    logits = model.forward(
+                        next_t.view(1, 1), cache=cache, logits_to_keep=1
+                    )
             eos_ready.synchronize()
             next_id = int(pinned.item())
             new_tokens.append(next_id)
@@ -183,7 +373,7 @@ def generate(
         t_end = time.perf_counter()
 
     prefill_s = t_prefill - t0
-    decode_s = t_end - t_prefill
+    decode_s = t_end - t_decode
     n_new = len(new_tokens)
     if prompt_len and prefill_s > 0:
         print(

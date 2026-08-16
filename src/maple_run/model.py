@@ -133,6 +133,23 @@ class KVCache:
         self.seqlen = torch.zeros((), dtype=torch.int64, device=device)
         self.seen = 0
 
+    def snapshot(self) -> dict:
+        """CPU-side handle plus cloned K/V; used to restore after graph warmup."""
+        return {
+            "seqlen": self.seqlen.clone(),
+            "seen": self.seen,
+            "k": [t.clone() for t in self.k],
+            "v": [t.clone() for t in self.v],
+        }
+
+    def restore(self, snap: dict) -> None:
+        self.seqlen.copy_(snap["seqlen"])
+        self.seen = snap["seen"]
+        for dst, src in zip(self.k, snap["k"], strict=True):
+            dst.copy_(src)
+        for dst, src in zip(self.v, snap["v"], strict=True):
+            dst.copy_(src)
+
     def update(self, layer_idx: int, key_states: torch.Tensor, value_states: torch.Tensor):
         start = self.seen
         end = start + key_states.shape[2]

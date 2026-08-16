@@ -73,6 +73,27 @@ def test_rtn4_gemv_packed_kn_matches_nk():
 
 
 @cuda
+def test_rtn4_gemv_fat_k_tile_matches_dequantized_linear():
+    """Decode lm_head tiles 4 RTN groups (BLOCK_K_WORDS=32) when K>=256."""
+    from maple_run.kernels.rtn4 import rtn4_gemv
+
+    rng = np.random.default_rng(3)
+    weight = rng.standard_normal((64, 256)).astype(np.float32)
+    packed, scales, biases = quantize_rtn(weight)
+    recon = dequantize_rtn(packed, scales, biases)
+
+    packed_t = torch.from_numpy(np.ascontiguousarray(packed)).cuda().to(torch.uint32)
+    scales_t = torch.from_numpy(np.ascontiguousarray(scales)).cuda()
+    biases_t = torch.from_numpy(np.ascontiguousarray(biases)).cuda()
+    x = torch.from_numpy(rng.standard_normal((1, 256)).astype(np.float32)).cuda()
+    y = rtn4_gemv(x, packed_t.t().contiguous(), scales_t.t().contiguous(),
+                  biases_t.t().contiguous(), packed_kn=True)
+    w_hat = torch.from_numpy(recon).cuda()
+    y_ref = torch.nn.functional.linear(x, w_hat)
+    torch.testing.assert_close(y, y_ref, rtol=1e-4, atol=1e-4)
+
+
+@cuda
 def test_rtn4_gemv_rejects_dense_weight():
     from maple_run.kernels.rtn4 import rtn4_gemv
 

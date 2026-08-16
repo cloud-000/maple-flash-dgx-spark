@@ -20,6 +20,8 @@ _CODES_PER_WORD = 16
 def _gemv_launch_meta(nwords: int, batch: int) -> tuple[int, int, int, int]:
     """BLOCK_N, BLOCK_K_WORDS, warps, stages. Decode (batch=1) needs many CTAs + fat K tiles."""
     if batch == 1:
+        if nwords >= 128:
+            return 8, 128, 4, 3
         if nwords >= 64:
             return 16, 64, 4, 4
         if nwords >= 32:

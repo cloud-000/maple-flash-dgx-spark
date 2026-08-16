@@ -21,9 +21,10 @@ hardware numbers. Vendored algorithm source is `docs/sources/mlx_lm_ternary.py`.
    never unpacks to a dense bf16 matrix.
 3. **Model** (`maple_run/model.py`): **done, then fused further.** Packed Maple
    forward, fused RMS/QKV/SwiGLU, decode attn, greedy+sampled generate.
-   Speed bench / CLI default is sampled (`T=1.0 top_p=0.95 top_k=20`), ~166
-   tok/s; greedy France (`--temperature 0`) is correctness only. Spark should
-   scale toward ~386 tok/s (`169 × 273/120`) before FlashHead. **Start here**
+   Speed bench / CLI default is sampled (`T=1.0 top_p=0.95 top_k=20`), ~254
+   tok/s (256-tok bench) / ~234 tok/s (700-tok haiku); greedy France
+   (`--temperature 0`) is correctness only. Spark should scale toward ~386
+   tok/s (`169 × 273/120`) before FlashHead. **Start here**
    (more kernel/launch efficiency).
 4. **FlashHead** (`maple_run/generate.py` / head clustering): not until asked.
 
