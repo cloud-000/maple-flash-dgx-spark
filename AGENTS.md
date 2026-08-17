@@ -19,13 +19,16 @@ hardware numbers. Vendored algorithm source is `docs/sources/mlx_lm_ternary.py`.
    checkpoint lives at `checkpoints/maple-2bit` (gitignored).
 2. **Kernels** (`maple_run/kernels/ternary_gemv.py`): **done.** Packed GEMV that
    never unpacks to a dense bf16 matrix.
-3. **Model** (`maple_run/model.py`): **done, then fused further.** Packed Maple
-   forward, fused RMS/QKV/SwiGLU, decode attn, greedy+sampled generate.
-   Speed bench / CLI default is sampled (`T=1.0 top_p=0.95 top_k=20`), ~254
-   tok/s (256-tok bench) / ~234 tok/s (700-tok haiku); greedy France
-   (`--temperature 0`) is correctness only. Spark should scale toward ~386
-   tok/s (`169 × 273/120`) before FlashHead. **Start here**
-   (more kernel/launch efficiency).
+3. **Model** (`maple_run/model.py`): **done, then fused and tuned twice.**
+   Packed Maple forward, fused RMS/QKV/SwiGLU, decode attn, fused router, fused
+   sampler, greedy+sampled generate. Speed bench / CLI default is sampled
+   (`T=1.0 top_p=0.95 top_k=20`), ~368 tok/s (256-tok bench) / ~364 tok/s
+   (700-tok haiku); greedy France (`--temperature 0`) is correctness only.
+   That is past the M4-scaled target computed against the bandwidth this host
+   actually delivers (~250 GB/s, not the 273 GB/s spec) and ~5% short of the
+   386 tok/s computed from the spec sheet. **Start here** (more kernel
+   efficiency) — and read "How to measure on this host" in the handoff first,
+   because naive kernel microbenchmarks on this box are off by 2-3x.
 4. **FlashHead** (`maple_run/generate.py` / head clustering): not until asked.
 
 Stop at the phase the user asked for. Do not skip packing tests to jump to a

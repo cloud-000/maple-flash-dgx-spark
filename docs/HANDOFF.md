@@ -4,10 +4,14 @@ This document is for the **next session**. The previous session diagnosed why
 `vllm serve deepgrove/maple-preview` failed on Spark, why the Hugging Face CUDA
 Transformers path is slow, and what a packed-kernel runtime has to do.
 
-**Phase 1–3 are done, including a body-fusion pass.** Next session is **more
-exact-head decode speed**, not FlashHead yet. Do not re-convert unless the
-packed checkpoint is missing. Do not start with a web search for Maple, MLX, or
-Spark bandwidth; read `docs/SOURCES.md` and `AGENTS.md` first.
+**Phase 1–3 are done, including two tuning passes.** Sampled decode is at
+~368 tok/s, past the M4-scaled target computed against the bandwidth this host
+actually delivers (~352) and ~5% short of the 386 computed against the spec
+sheet. Next session is still **more exact-head decode speed**, not FlashHead,
+until the user asks. Do not re-convert unless the packed checkpoint is missing.
+Do not start with a web search for Maple, MLX, or Spark bandwidth; read
+`docs/SOURCES.md` and `AGENTS.md` first — and read "How to measure on this host"
+below before trusting any kernel benchmark.
 
 ## Status (2026-08-16)
 
@@ -15,7 +19,7 @@ Spark bandwidth; read `docs/SOURCES.md` and `AGENTS.md` first.
 |---|---|
 | 1 Pack / convert | **Done.** NumPy `ternarize` / `pack_2bit` / 4-bit RTN; streaming converter; tests in `tests/test_pack.py` and `tests/test_convert.py`. |
 | 2 Packed GEMV kernel | **Done.** Triton packed GEMV in `maple_run/kernels/ternary_gemv.py`; never unpacks to dense bf16. Tests in `tests/test_ternary_gemv.py`. |
-| 3 Model decode | **Done, then fused further.** Packed forward + fused RMS/QKV/SwiGLU/decode attn + pinned decode GEMV tiles. Exact-head sampled ~254 tok/s on the 256-tok bench, ~234 tok/s on 700-tok haiku. CUDA graphs used when replay matches eager sampled ids. Still short of bandwidth scaling. |
+| 3 Model decode | **Done, fused, and tuned twice.** Packed forward + fused RMS/QKV/SwiGLU/decode attn + fused router + fused sampler. Exact-head sampled **~368 tok/s** on the 256-tok bench, **~364 tok/s** on 700-tok haiku (was 254/234). CUDA graphs used when replay matches eager sampled ids. |
 | 4 FlashHead | **Do not start** until the user asks. Exact-head body/head kernels first. |
 | 5 HTTP | Not started |
 
@@ -231,8 +235,23 @@ weights as uint32 + `row_alpha`, and runs:
   `switch_mlp`; no 256-expert Python loop, no `tokens_per_expert.cpu()`)
 - Decode: fused input-RMS into QKV, fused add+RMSNorm, fused expert SwiGLU,
   preallocated KV, Triton GQA for `q_len=1`; prefill still torch SDPA
+- `router_topk`: router GEMV + softmax + top-8 + renormalize in two launches
+  (`kernels/router.py`). The torch chain it replaced was eight launches per
+  layer over a 256-wide vector and cost 633 us/token — more than the router
+  weight traffic itself
 - 4-bit RTN embedding gather + `rtn4_gemv` exact `lm_head` (FlashHead is phase 4)
+- `fused_sample`: top-k + temperature + nucleus + CDF inverse in two launches
+  (`kernels/sampler.py`), replacing ~10 eager launches outside the graph
 - Chat-template generate. CLI defaults are sampled: `--temperature 1.0 --top-p 0.95 --top-k 20`. Greedy is `--temperature 0`.
+
+Packed codes stay in the checkpoint's `[N, nwords]` order. An earlier transpose
+to `[nwords, N]` put consecutive output rows together but scattered each CTA's
+K tile across `BLOCK_K_WORDS` addresses `N*4` bytes apart; read cold the
+untransposed layout is faster everywhere (QKV 141 vs 125 GB/s, O 191 vs 165,
+lm_head 215 vs 194). `packed_kn=True` still works in the kernels; nothing uses
+it. That layout choice also flipped the right dtype for the RTN scales: with a
+row's 32 groups contiguous, bf16 scales/biases win (820 vs 903 us on the head),
+where under the transposed layout they had lost.
 
 Speed command (do not use greedy France for tok/s):
 
@@ -245,20 +264,51 @@ Or `uv run pytest tests/test_bench.py --bench -s`. Greedy `--temperature 0` / Fr
 `--max-tokens 128` is only a correctness check (should EOS at Paris). Argmax skips
 softmax/top-k/nucleus/multinomial and often stops at ~38 tok, which inflates tok/s.
 
-Measured on this GB10 host (2026-08-16), exact 4-bit head, no FlashHead:
+Measured on this GB10 host (2026-08-17), exact 4-bit head, no FlashHead:
 
 | | |
 |---|---|
-| Packed weight traffic | **462 MB/token** |
-| Unpacked bf16 traffic (same active tensors) | **2384 MB/token** (~2.3 GB handoff estimate) |
-| Bandwidth ceiling | `273 / 0.462 ≈ 590` tok/s if fully fused |
-| M4-scaled target (no FlashHead) | `169 × 273 / 120 ≈ 386` tok/s |
-| Decode **sampled** T=1.0 top-p=0.95 top-k=20 (haiku, 256 tok bench) | **~254 tok/s** |
-| Decode **sampled** T=1.0 top-p=0.95 top-k=20 (haiku, 700 tok) | **~234 tok/s** |
-| Decode greedy France 38 tok EOS (not a speed bench) | ~278 tok/s; still prints Paris |
-| Isolated `rtn4_gemv` lm_head | ~0.97 ms / **~201 GB/s** (was ~1.36 ms / 143 GB/s) |
-| Decode QKV GEMV | ~153 GB/s |
-| Body SwiGLU | ~200 GB/s of 273 |
+| Packed weight traffic | **417 MB/token** (was 462; router + RTN scales are bf16 now) |
+| Unpacked bf16 traffic (same active tensors) | **2359 MB/token** (~2.3 GB handoff estimate) |
+| **Achievable** read bandwidth, measured | **~250 GB/s** — see "273 GB/s is not reachable" below |
+| Bandwidth ceiling at that rate | `250 / 0.417 ≈ 600` tok/s if fully fused |
+| M4-scaled target, spec bandwidth | `169 × 273 / 120 ≈ 386` tok/s |
+| M4-scaled target, **achievable** bandwidth | `169 × 250 / 120 ≈ 352` tok/s |
+| Decode **sampled** T=1.0 top-p=0.95 top-k=20 (haiku, 256 tok bench) | **~368 tok/s** (was 254) |
+| Decode **sampled** T=1.0 top-p=0.95 top-k=20 (haiku, 700 tok) | **~364 tok/s** (was 234) |
+| Decode greedy France 42 tok EOS (not a speed bench) | ~390 tok/s; still prints Paris |
+
+Effective traffic at 368 tok/s is `368 × 0.417 ≈ 153` GB/s — **61% of the 250 GB/s
+this host actually delivers**, against M4's ~65% of its own peak. Exact-head
+efficiency is now roughly M4-class; what is left is the last few percent.
+
+### 273 GB/s is not reachable — calibrate against 250
+
+The 273 GB/s in the DGX Spark spec is not what a kernel can get. A trivial
+Triton streaming reduction over 175 MB tops out at **250 GB/s**, and torch's own
+`sum`/`max` over 200-800 MB get 236-241 GB/s. Every "% of peak" below is against
+250, not 273. This also moves the M4-scaled target: scaled by bandwidth the
+machine actually has, it is ~352 tok/s, which decode is already past. 386 tok/s
+is still a fair stretch goal (it needs 161 GB/s effective, 64% of achievable)
+but it is not what "Spark at M4 efficiency" works out to.
+
+### Where the 2.7 ms/token goes
+
+By ablation (replace one kernel with a memoized no-op and re-time full decode --
+the profiler's per-kernel self time over-attributes by ~35% here):
+
+| Kernel | us/token | of which | % of achievable peak |
+|---|---|---|---|
+| `rtn4_gemv` lm_head | ~720-825 | 175 MB | ~85% |
+| `ternary_gemv` QKV + O | ~350-480 | 63 MB | ~55% |
+| `ternary_expert_swiglu` | ~365-460 | 101 MB | ~85% |
+| `ternary_expert_gemv` down | ~290 | 50 MB | ~70% |
+| `router_topk` (both launches) | ~120-200 | 25 MB | — |
+| fused sampler (outside the graph) | ~37 | — | — |
+| `add_rms_norm` / `moe_reduce_add` | ~11 / ~19 | — | — |
+
+Ranges are run-to-run spread, not uncertainty in the method; see the
+measurement notes below.
 
 CUDA-graph capture of the full decode forward is enabled when an untimed
 8-token replay matches eager sampled token ids at the same RNG state (KV
@@ -267,23 +317,53 @@ unset). Capture sits between prefill and the decode timer so it does not
 inflate tok/s. Previous capture without restore wrote warmup tokens into KV
 and looked like wrong tokens / early EOS.
 
-Effective traffic at 254 tok/s is `254 × 0.462 ≈ 117` GB/s — 43% of Spark
-peak vs ~65% of M4 peak. Body GEMV tiles and graphs closed much of the launch
-gap; the exact 4-bit head is still ~0.97 ms/token.
+### How to measure on this host (read before tuning anything)
+
+This box misled three separate rounds of tuning. All four traps are real:
+
+1. **A microbench in a Python loop measures Triton launch overhead, not the
+   kernel.** ~10 us/launch of CPU time swamps anything under ~20 us. Capture N
+   calls in a CUDA graph and time the replay.
+2. **A single-buffer microbench measures L2.** A 1-4 MB weight stays resident
+   and reports 2-3x the bandwidth the same kernel gets in the model, where every
+   launch reads a different layer. Rotate over enough distinct buffers to pass
+   ~75 MB; past that the number stops moving.
+3. **Back-to-back launches in a sweep overlap; the model's do not** — but this
+   turned out to cost only ~0.5 us/launch, so it is *not* where the gap is. The
+   gap was L2 (trap 2) plus program count.
+4. **Run-to-run spread is ~5%, and a long sweep drifts.** Timing configs one
+   after another reliably favours whichever ran first. Round-robin the
+   candidates and take each one's median. Two "wins" of ~100 us/token
+   evaporated under this treatment, and one was a regression.
+
+The honest tools, in order of trust: full sampled decode timed several times
+(`tests/test_bench.py --bench`), ablation against full decode, round-robin A/B
+of launch configs, L2-cold microbench, and last a plain microbench.
 
 ### Open issues (next session: more exact-head speed, not FlashHead)
 
-1. **Bandwidth not scaling to 386 tok/s.** Sampled decode is ~254 tok/s
-   (256-tok bench) / ~234 tok/s (700-tok haiku). Do not unpack ternary codes.
-   Raise kernel % of 273 GB/s: exact `rtn4_gemv` is ~201 GB/s (fat K-tile with
-   per-group scale; a single-scale fat tile hits ~270 GB/s but is wrong).
-   QKV ~153 GB/s; SwiGLU ~200 GB/s. `ternary_expert_down_sum` is currently
-   slower than split down-GEMV + `moe_reduce`. **Measure tok/s with sampled
-   decode** (`--temperature 1.0 --top-p 0.95 --top-k 20`), not greedy France.
-2. **Greedy think-trace loops.** Sampling is in `generate.py`. Greedy haiku
-   `--max-tokens 700` still hits the cap recounting syllables. France T=0
-   remains the greedy correctness check (must print Paris).
-3. CUDA graphs are on when 8-token replay matches eager sampled ids. Do not
+1. **QKV/O is the weakest kernel**, ~55% of achievable against ~85% for the
+   lm_head and the expert SwiGLU. It is the only body GEMV with a fused input
+   RMSNorm. That norm no longer costs a pre-pass (rstd is a scalar and factors
+   out of the dot product, so sumsq accumulates inside the main loop), but the
+   O projection with no norm at all still runs materially better, so there may
+   be more here. Do not unpack ternary codes to get it.
+2. **The lm_head is ~30% of the token** at ~213 GB/s (85% of achievable). Its
+   traffic is already minimal for an exact head: 4-bit codes plus bf16
+   scales/biases. Getting past this probably means FlashHead (phase 4), which
+   is the sanctioned next step *only when the user asks*.
+3. **The fused sampler is the only thing left outside the CUDA graph** (~37
+   us/token, three eager launches including the `torch.rand` for the uniform).
+   A self-feeding graph that samples and writes its own next `token_ids` would
+   absorb it; PyTorch does support captured RNG, but the graph-vs-eager id
+   check would need rework.
+4. `ternary_expert_down_sum` (down GEMV + top-k reduce fused) is still unused:
+   `moe_reduce_add` only costs ~19 us/token in situ, so the fusion is worth
+   less than it looks.
+5. **Greedy think-trace loops.** Greedy haiku `--max-tokens 700` still hits the
+   cap recounting syllables. France T=0 remains the greedy correctness check
+   (must print Paris). **Measure tok/s with sampled decode**, never greedy.
+6. CUDA graphs are on when 8-token replay matches eager sampled ids. Do not
    skip the match check. Capture warmup must restore KV `seqlen` and the
    default CUDA RNG (CLI `--seed` unset uses that generator).
 
@@ -306,6 +386,8 @@ Only after packed decode works. Do not start here.
 | `src/maple_run/kernels/ternary_gemv.py` | Packed GEMV (Triton); decode tiles pinned |
 | `src/maple_run/kernels/ternary_expert.py` | Fused indexed expert GEMV + SwiGLU |
 | `src/maple_run/kernels/fused_norm.py` | RMSNorm, add+RMSNorm, MoE reduce |
+| `src/maple_run/kernels/router.py` | Fused router GEMV + softmax + top-k + renorm |
+| `src/maple_run/kernels/sampler.py` | Fused top-k / temperature / nucleus sampling |
 | `src/maple_run/kernels/decode_attn.py` | q_len=1 QK-RMS/RoPE + GQA (loops seqlen/SWA) |
 | `src/maple_run/kernels/rtn4.py` | 4-bit RTN embedding + lm_head GEMV |
 | `src/maple_run/linear.py` | PackedTernaryLinear / Experts / RTN4 |
