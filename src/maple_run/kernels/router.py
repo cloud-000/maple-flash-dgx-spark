@@ -34,6 +34,7 @@ def _router_gemv_kernel(
     SPLIT_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    STREAM_W: tl.constexpr,
 ):
     """Partial router logits ``y[t, split, n] = sum_k x[t, k] * w[n, k]``."""
     pid_n = tl.program_id(0)
@@ -53,11 +54,17 @@ def _router_gemv_kernel(
     for k0 in range(k_start, k_end, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         mask_k = offs_k < k_end
-        x = tl.load(x_row + offs_k * stride_xk, mask=mask_k, other=0.0).to(tl.float32)
+        x = tl.load(
+            x_row + offs_k * stride_xk,
+            mask=mask_k,
+            other=0.0,
+            eviction_policy="evict_last" if STREAM_W else "",
+        ).to(tl.float32)
         w = tl.load(
             w_row + offs_k[None, :] * stride_wk,
             mask=mask_n[:, None] & mask_k[None, :],
             other=0.0,
+            eviction_policy="evict_first" if STREAM_W else "",
         ).to(tl.float32)
         acc += tl.sum(w * x[None, :], axis=1)
 
@@ -183,6 +190,7 @@ def router_topk(
         SPLIT_K=split_k,
         BLOCK_N=block_n,
         BLOCK_K=128,
+        STREAM_W=tokens == 1,
         num_warps=num_warps,
         num_stages=num_stages,
     )

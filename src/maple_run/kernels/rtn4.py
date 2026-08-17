@@ -87,6 +87,7 @@ def _rtn4_gemv_kernel(
     GROUP_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K_WORDS: tl.constexpr,
+    STREAM_W: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -109,6 +110,7 @@ def _rtn4_gemv_kernel(
             packed_ptr + offs_n[:, None] * stride_wn + offs_w[None, :] * stride_ww,
             mask=mask_n[:, None] & mask_w[None, :],
             other=0,
+            eviction_policy="evict_first" if STREAM_W else "",
         ).to(tl.uint32)
         codes = (packed[:, :, None] >> shifts[None, None, :]) & 0xF
         q = tl.reshape(codes.to(tl.float32), (BLOCK_N, BLOCK_K))
@@ -119,6 +121,7 @@ def _rtn4_gemv_kernel(
             x_row + offs_k * stride_xk,
             mask=mask_k,
             other=0.0,
+            eviction_policy="evict_last" if STREAM_W else "",
         ).to(tl.float32)
         offs_g = (w0 * 8) // GROUP_SIZE + tl.arange(0, N_GROUPS_TILE)
         mask_g = offs_g < n_groups
@@ -237,6 +240,7 @@ def rtn4_gemv(
         GROUP_SIZE=group_size,
         BLOCK_N=block_n,
         BLOCK_K_WORDS=block_k_words,
+        STREAM_W=batch == 1,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -271,6 +275,7 @@ def _rtn4_indexed_gemv_kernel(
     CLUSTER_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K_WORDS: tl.constexpr,
+    STREAM_W: tl.constexpr,
 ):
     """GEMV over flattened ``head[cluster_ids[n // C], n % C]`` rows."""
     pid_n = tl.program_id(0)
@@ -301,6 +306,7 @@ def _rtn4_indexed_gemv_kernel(
             packed_row[:, None] + offs_w[None, :] * stride_ww,
             mask=mask_n[:, None] & mask_w[None, :],
             other=0,
+            eviction_policy="evict_first" if STREAM_W else "",
         ).to(tl.uint32)
         codes = (packed[:, :, None] >> shifts[None, None, :]) & 0xF
         q = tl.reshape(codes.to(tl.float32), (BLOCK_N, BLOCK_K))
@@ -311,6 +317,7 @@ def _rtn4_indexed_gemv_kernel(
             x_row + offs_k * stride_xk,
             mask=mask_k,
             other=0.0,
+            eviction_policy="evict_last" if STREAM_W else "",
         ).to(tl.float32)
         offs_g = (w0 * 8) // GROUP_SIZE + tl.arange(0, N_GROUPS_TILE)
         mask_g = offs_g < n_groups
@@ -425,6 +432,7 @@ def rtn4_indexed_gemv(
         CLUSTER_SIZE=cluster_size,
         BLOCK_N=block_n,
         BLOCK_K_WORDS=block_k_words,
+        STREAM_W=batch == 1,
         num_warps=num_warps,
         num_stages=num_stages,
     )

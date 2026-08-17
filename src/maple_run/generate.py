@@ -123,6 +123,8 @@ class _DecodeGraph:
     graph: torch.cuda.CUDAGraph
     token_ids: torch.Tensor
     logits: torch.Tensor
+    uniform: torch.Tensor | None = None
+    next_id: torch.Tensor | None = None
 
 
 def _next_token(
@@ -157,21 +159,66 @@ def _next_token(
     )
 
 
-def _capture_decode_graph(model, cache, token_ids: torch.Tensor) -> _DecodeGraph:
-    """Capture ``forward(token_ids)`` on ``cache``. Caller restores KV afterwards."""
+def _capture_decode_graph(
+    model,
+    cache,
+    token_ids: torch.Tensor,
+    *,
+    sample: tuple | None = None,
+) -> _DecodeGraph:
+    """Capture ``forward(token_ids)`` on ``cache``. Caller restores KV afterwards.
+
+    ``sample`` is ``(workspace, temperature, top_p, top_k)`` to also capture
+    ``fused_sample`` so the two sampler launches sit inside the replay instead
+    of paying eager launch latency between tokens. ``uniform`` is a graph input
+    copied each replay so ``--seed`` stays on the same generator as eager.
+    """
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     logits = None
+    uniform = None
+    next_id = None
     with torch.cuda.stream(stream):
         for _ in range(_GRAPH_WARMUP):
             logits = model.forward(token_ids, cache=cache, logits_to_keep=1)
+            if sample is not None:
+                ws, temperature, top_p, top_k = sample
+                fused_sample(
+                    logits[0, -1],
+                    torch.rand((), device=token_ids.device),
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    workspace=ws,
+                )
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            logits = model.forward(token_ids, cache=cache, logits_to_keep=1)
+        if sample is not None:
+            ws, temperature, top_p, top_k = sample
+            uniform = torch.empty((), device=token_ids.device)
+            uniform.uniform_()
+            with torch.cuda.graph(graph):
+                logits = model.forward(token_ids, cache=cache, logits_to_keep=1)
+                next_id = fused_sample(
+                    logits[0, -1],
+                    uniform,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    workspace=ws,
+                )
+        else:
+            with torch.cuda.graph(graph):
+                logits = model.forward(token_ids, cache=cache, logits_to_keep=1)
     torch.cuda.current_stream().wait_stream(stream)
     if logits is None:
         raise RuntimeError("CUDA graph capture did not produce logits.")
-    return _DecodeGraph(graph=graph, token_ids=token_ids, logits=logits)
+    return _DecodeGraph(
+        graph=graph,
+        token_ids=token_ids,
+        logits=logits,
+        uniform=uniform,
+        next_id=next_id,
+    )
 
 
 def _decode_n(
@@ -301,6 +348,22 @@ def _try_decode_graph(
         )
         return None
     log("CUDA graph decode: replay matches eager sampled ids")
+    if sampler_ws is not None and not greedy:
+        try:
+            captured = _capture_decode_graph(
+                model,
+                cache,
+                token_ids,
+                sample=(sampler_ws, temperature, top_p, top_k),
+            )
+            cache.restore(snap)
+            log("CUDA graph decode: fused sampler captured")
+        except Exception as exc:
+            cache.restore(snap)
+            log(
+                f"CUDA graph sampler capture failed ({exc}); "
+                "using forward-only graph"
+            )
     return captured
 
 
@@ -697,27 +760,40 @@ def run_generate(
         t_decode = time.perf_counter()
         pinned = torch.empty((), dtype=torch.long, pin_memory=True)
         eos_ready = torch.cuda.Event()
+        sample_in_graph = graph is not None and graph.next_id is not None
+        next_t: torch.Tensor | None = None
         for i in range(max_tokens):
-            next_t = _next_token(
-                logits,
-                greedy=greedy,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                generator=generator,
-                sampler_ws=sampler_ws,
-            )
+            if next_t is None:
+                next_t = _next_token(
+                    logits,
+                    greedy=greedy,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    generator=generator,
+                    sampler_ws=sampler_ws,
+                )
             pinned.copy_(next_t, non_blocking=True)
             eos_ready.record()
             if i + 1 < max_tokens:
                 if graph is not None:
                     graph.token_ids.copy_(next_t.view(1, 1))
+                    if sample_in_graph:
+                        assert graph.uniform is not None
+                        graph.uniform.copy_(
+                            torch.rand((), device=model.device, generator=generator)
+                        )
                     graph.graph.replay()
                     logits = graph.logits
+                    if sample_in_graph:
+                        next_t = graph.next_id
+                    else:
+                        next_t = None
                 else:
                     logits = model.forward(
                         next_t.view(1, 1), cache=cache, logits_to_keep=1
                     )
+                    next_t = None
             eos_ready.synchronize()
             next_id = int(pinned.item())
             new_tokens.append(next_id)

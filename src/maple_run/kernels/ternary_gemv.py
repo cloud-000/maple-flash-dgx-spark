@@ -1,8 +1,14 @@
 """Packed ternary GEMV: y = x @ W_packed, W never unpacked to bf16.
 
-Target: DGX Spark GB10 (sm_121). Triton reads uint32 codes in place, accumulates
-``(code - 1) * x`` in float32, then scales by per-row ``α``. A kernel that
-dequantizes to a dense bf16 matrix and then matmuls has failed the design.
+    Target: DGX Spark GB10 (sm_121). Triton reads uint32 codes in place, accumulates
+    ``(code - 1) * x`` in float32, then scales by per-row ``α``. A kernel that
+    dequantizes to a dense bf16 matrix and then matmuls has failed the design.
+
+    Decode (batch=1) weight loads use ``evict_first`` so a layer's codes do not
+    occupy L2 after the GEMV; activations stay ``evict_last``. Prefill reuses the
+    same tiles across tokens, so those hints stay off. In-model QKV/O otherwise
+    lands at ~131 GB/s against ~175 isolated because the next kernel's weights
+    fight the last.
 
 Packing (see ``maple_run.pack``): 16 LSB-first 2-bit codes per uint32, codes
 ``{0, 1, 2}`` = ``{−1, 0, +1} + 1``.
@@ -53,6 +59,7 @@ def _ternary_gemv_kernel(
     stride_yn,
     eps,
     HAS_RMS: tl.constexpr,
+    STREAM_W: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K_WORDS: tl.constexpr,
 ):
@@ -82,6 +89,7 @@ def _ternary_gemv_kernel(
             packed_ptr + offs_n[:, None] * stride_wn + offs_w[None, :] * stride_ww,
             mask=mask_n[:, None] & mask_w[None, :],
             other=0,
+            eviction_policy="evict_first" if STREAM_W else "",
         ).to(tl.uint32)
         # codes[n, w, i] = (word >> (2*i)) & 3  →  ternary = code - 1 ∈ {-1,0,+1}
         codes = (packed[:, :, None] >> shifts[None, None, :]) & 0x3
@@ -94,6 +102,7 @@ def _ternary_gemv_kernel(
             x_row + offs_k * stride_xk,
             mask=mask_k,
             other=0.0,
+            eviction_policy="evict_last" if STREAM_W else "",
         ).to(tl.float32)
         if HAS_RMS:
             sumsq += tl.sum(x_tile * x_tile, axis=0)
@@ -195,6 +204,7 @@ def ternary_gemv(
         y.stride(1),
         float(rms_eps),
         HAS_RMS=has_rms,
+        STREAM_W=batch == 1,
         BLOCK_N=block_n,
         BLOCK_K_WORDS=block_k_words,
         num_warps=num_warps,

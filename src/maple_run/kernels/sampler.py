@@ -1,11 +1,8 @@
 """Fused top-k / temperature / nucleus sampling over the full vocab.
 
 The torch chain (``topk`` -> ``softmax`` -> ``sort`` -> ``cumsum`` -> ``scatter``
--> ``multinomial``) is about ten launches per token, and unlike the decode
-forward it runs outside the CUDA graph, so it pays CPU launch latency too:
-~204 us/token measured by ablation on this host. This is two launches — a
-per-block top-k over the 151936 logits, then one CTA that merges them,
-softmaxes, applies the nucleus and inverts the CDF.
+-> ``multinomial``) is about ten launches per token. Two Triton launches replace
+that; generate captures them in the decode CUDA graph when replay matches eager.
 
 Randomness still comes from torch: the caller passes one uniform drawn from the
 generator ``--seed`` selects, so seeded runs stay reproducible and the CUDA

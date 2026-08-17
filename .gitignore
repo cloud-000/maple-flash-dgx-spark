@@ -23,3 +23,6 @@ _src/
 
 # docs
 docs/sources/
+
+# tmp
+tmp_ab_speed.py

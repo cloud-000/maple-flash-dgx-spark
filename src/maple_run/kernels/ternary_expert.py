@@ -75,6 +75,7 @@ def _ternary_expert_gemv_kernel(
     stride_yn,
     BLOCK_N: tl.constexpr,
     BLOCK_K_WORDS: tl.constexpr,
+    STREAM_W: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_s = tl.program_id(1)
@@ -98,6 +99,7 @@ def _ternary_expert_gemv_kernel(
             packed_e + offs_n[:, None] * stride_wn + offs_w[None, :] * stride_ww,
             mask=mask_n[:, None] & mask_w[None, :],
             other=0,
+            eviction_policy="evict_first" if STREAM_W else "",
         ).to(tl.uint32)
         codes = (packed[:, :, None] >> shifts[None, None, :]) & 0x3
         ternary = tl.reshape(codes.to(tl.float32) - 1.0, (BLOCK_N, BLOCK_K))
@@ -108,6 +110,7 @@ def _ternary_expert_gemv_kernel(
             x_row + offs_k * stride_xk,
             mask=mask_k,
             other=0.0,
+            eviction_policy="evict_last" if STREAM_W else "",
         ).to(tl.float32)
         acc += tl.sum(ternary * x_tile[None, :], axis=1)
 
@@ -193,6 +196,12 @@ def ternary_expert_gemv(
         )
 
     slots = slot_x.shape[0]
+    if x.shape[:-1] == id_shape[:-1]:
+        n_tokens = int(x.numel() // k_in)
+    elif len(id_shape) > 1:
+        n_tokens = int(slots // id_shape[-1])
+    else:
+        n_tokens = slots
     ids = expert_ids.reshape(slots).contiguous()
     if ids.dtype not in (torch.int32, torch.int64):
         ids = ids.to(torch.int32)
@@ -218,6 +227,7 @@ def ternary_expert_gemv(
         y.stride(1),
         BLOCK_N=block_n,
         BLOCK_K_WORDS=block_k_words,
+        STREAM_W=n_tokens == 1,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -248,6 +258,7 @@ def _ternary_expert_swiglu_kernel(
     TOPK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K_WORDS: tl.constexpr,
+    STREAM_W: tl.constexpr,
 ):
     """Fused up+gate GEMV + SiLU/clamp. ``N`` is the intermediate size (half of packed rows)."""
     pid_n = tl.program_id(0)
@@ -273,11 +284,13 @@ def _ternary_expert_swiglu_kernel(
             packed_e + offs_n[:, None] * stride_wn + offs_w[None, :] * stride_ww,
             mask=mask_n[:, None] & mask_w[None, :],
             other=0,
+            eviction_policy="evict_first" if STREAM_W else "",
         ).to(tl.uint32)
         packed_gate = tl.load(
             packed_e + (offs_n + N)[:, None] * stride_wn + offs_w[None, :] * stride_ww,
             mask=mask_n[:, None] & mask_w[None, :],
             other=0,
+            eviction_policy="evict_first" if STREAM_W else "",
         ).to(tl.uint32)
         codes_up = (packed_up[:, :, None] >> shifts[None, None, :]) & 0x3
         codes_gate = (packed_gate[:, :, None] >> shifts[None, None, :]) & 0x3
@@ -285,7 +298,12 @@ def _ternary_expert_swiglu_kernel(
         ternary_gate = tl.reshape(codes_gate.to(tl.float32) - 1.0, (BLOCK_N, BLOCK_K))
         offs_k = w0 * 16 + tl.arange(0, BLOCK_K)
         mask_k = offs_k < (nwords * 16)
-        x_tile = tl.load(x_row + offs_k * stride_xk, mask=mask_k, other=0.0).to(tl.float32)
+        x_tile = tl.load(
+            x_row + offs_k * stride_xk,
+            mask=mask_k,
+            other=0.0,
+            eviction_policy="evict_last" if STREAM_W else "",
+        ).to(tl.float32)
         acc_up += tl.sum(ternary_up * x_tile[None, :], axis=1)
         acc_gate += tl.sum(ternary_gate * x_tile[None, :], axis=1)
 
@@ -301,17 +319,6 @@ def _ternary_expert_swiglu_kernel(
     tl.store(y_ptr + pid_s * stride_ys + offs_n * stride_yn, out, mask=mask_n)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 16, "BLOCK_K_WORDS": 8}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 32, "BLOCK_K_WORDS": 8}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K_WORDS": 8}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_N": 32, "BLOCK_K_WORDS": 16}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K_WORDS": 16}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_N": 128, "BLOCK_K_WORDS": 8}, num_warps=8, num_stages=2),
-    ],
-    key=["N", "nwords", "TOPK"],
-)
 @triton.jit
 def _ternary_expert_down_sum_kernel(
     x_ptr,
@@ -343,6 +350,7 @@ def _ternary_expert_down_sum_kernel(
     TOPK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K_WORDS: tl.constexpr,
+    STREAM_W: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_t = tl.program_id(1)
@@ -367,14 +375,18 @@ def _ternary_expert_down_sum_kernel(
                 packed_e + offs_n[:, None] * stride_wn + offs_w[None, :] * stride_ww,
                 mask=mask_n[:, None] & mask_w[None, :],
                 other=0,
+                eviction_policy="evict_first" if STREAM_W else "",
             ).to(tl.uint32)
             codes = (packed[:, :, None] >> shifts[None, None, :]) & 0x3
             ternary = tl.reshape(codes.to(tl.float32) - 1.0, (BLOCK_N, BLOCK_K))
             offs_k = w0 * 16 + tl.arange(0, BLOCK_K)
             mask_k = offs_k < (nwords * 16)
-            x_tile = tl.load(x_row + offs_k * stride_xk, mask=mask_k, other=0.0).to(
-                tl.float32
-            )
+            x_tile = tl.load(
+                x_row + offs_k * stride_xk,
+                mask=mask_k,
+                other=0.0,
+                eviction_policy="evict_last" if STREAM_W else "",
+            ).to(tl.float32)
             partial += tl.sum(ternary * x_tile[None, :], axis=1)
         alpha = tl.load(alpha_e + offs_n * stride_an, mask=mask_n, other=0.0).to(tl.float32)
         acc += slot_w * partial * alpha
@@ -449,6 +461,7 @@ def ternary_expert_swiglu(
         TOPK=topk,
         BLOCK_N=block_n,
         BLOCK_K_WORDS=block_k_words,
+        STREAM_W=tokens == 1,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -500,10 +513,12 @@ def ternary_expert_down_sum(
     else:
         res = y
 
-    def _grid(meta):
-        return (triton.cdiv(n_out, meta["BLOCK_N"]), tokens)
-
-    _ternary_expert_down_sum_kernel[_grid](
+    if tokens == 1:
+        block_n, block_k_words, num_warps, num_stages = _expert_launch_meta(nwords)
+    else:
+        block_n, block_k_words, num_warps, num_stages = 32, 16, 4, 3
+    grid = (triton.cdiv(n_out, block_n), tokens)
+    _ternary_expert_down_sum_kernel[grid](
         x_mat,
         packed_weight,
         row_alpha,
@@ -531,6 +546,11 @@ def ternary_expert_down_sum(
         y.stride(1),
         HAS_RESIDUAL=has_res,
         TOPK=topk,
+        BLOCK_N=block_n,
+        BLOCK_K_WORDS=block_k_words,
+        STREAM_W=tokens == 1,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     leading = tuple(expert_ids.shape[:-1])
     return y.reshape(*leading, n_out)

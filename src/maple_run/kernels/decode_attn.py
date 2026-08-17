@@ -365,6 +365,11 @@ def gqa_splits(max_len: int, window: int | None) -> int:
     """
     span = max_len if window is None else min(max_len, window)
     tiles = max(1, -(-span // _BLOCK_T))
+    # Up to one SWA window of tiles, n_kv=4 programs already cover a 512-token
+    # loop; splitting would only add a combine launch. Past that, split so the
+    # grid is not stuck at 4 resident programs.
+    if tiles <= 8:
+        return 1
     # Power of two: the combine kernel indexes splits with ``tl.arange``.
     # Rounded up -- a split with no tiles left to cover exits immediately and
     # the combine drops it, so overshooting costs far less than leaving the
