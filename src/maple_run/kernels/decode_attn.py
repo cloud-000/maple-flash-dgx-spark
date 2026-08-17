@@ -353,7 +353,6 @@ def apply_qkv_decode(
 
 
 _BLOCK_T = 64
-_MIN_SPLIT_TILES = 1
 _MAX_SPLITS = 8
 
 
@@ -367,8 +366,11 @@ def gqa_splits(max_len: int, window: int | None) -> int:
     span = max_len if window is None else min(max_len, window)
     tiles = max(1, -(-span // _BLOCK_T))
     # Power of two: the combine kernel indexes splits with ``tl.arange``.
+    # Rounded up -- a split with no tiles left to cover exits immediately and
+    # the combine drops it, so overshooting costs far less than leaving the
+    # machine at n_kv resident programs.
     splits = 1
-    while splits * 2 <= min(_MAX_SPLITS, max(1, tiles // _MIN_SPLIT_TILES)):
+    while splits < min(_MAX_SPLITS, tiles):
         splits *= 2
     return splits
 

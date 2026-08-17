@@ -52,15 +52,13 @@ def _rtn4_launch_meta(nwords: int, batch: int) -> tuple[int, int, int, int]:
 
     ``BLOCK_K_WORDS`` is a multiple of 8 so each K-tile holds a whole number of
     RTN groups (8 uint32 = 64 codes). Decode (batch=1) uses fat K tiles; one
-    group per tile was ~140 GB/s on the lm_head, four groups with per-group
-    scale/bias ~196 GB/s. ``BLOCK_N=32`` keeps the packed-KN row load at a full
-    128-byte line, which is also why the fp32 scales/biases are left alone:
-    halving them to bf16 saves 19 MB/token but drops those loads to 64 bytes
-    and measured *slower* (155 vs 196 GB/s).
+    group per tile was ~140 GB/s on the lm_head, eight groups with per-group
+    scale/bias ~213 GB/s. With the codes untransposed a row's 32 groups are
+    contiguous, so bf16 scales/biases also pay off here (820 vs 903 us).
     """
     if batch == 1:
         if nwords >= 32:
-            return 32, 32, 2, 4
+            return 16, 64, 2, 2
         if nwords >= 16:
             return 32, 16, 2, 3
         return 64, 8, 2, 2

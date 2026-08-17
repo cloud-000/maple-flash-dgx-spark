@@ -411,12 +411,13 @@ def _as_uint32(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.uint32)
 
 
-def packed_decode_bytes(config: dict, router_bytes: int = 2) -> dict[str, int]:
+def packed_decode_bytes(config: dict, side_bytes: int = 2) -> dict[str, int]:
     """HBM bytes touched per decode token (weights only; KV depends on context).
 
-    ``router_bytes`` is the element size the router weight is held in at
-    runtime; see ``MapleForCausalLM._cast_router``. Everything else unquantized
-    (``row_alpha``, RTN scales/biases, norms) stays float32 as converted.
+    ``side_bytes`` is the element size the router weight and the RTN
+    scales/biases are held in at runtime; see
+    ``MapleForCausalLM._cast_side_tensors``. ``row_alpha`` and the norms stay
+    float32 as converted.
     """
     n_layers = int(config["num_hidden_layers"])
     hidden = int(config["hidden_size"])
@@ -436,12 +437,12 @@ def packed_decode_bytes(config: dict, router_bytes: int = 2) -> dict[str, int]:
     qkv_n = (n_q + 2 * n_kv) * head_dim
     attn_codes = n_layers * (qkv_n + hidden) * hidden // 4  # 2-bit → 4 weights/byte
     attn_alpha = n_layers * (qkv_n + hidden) * 4
-    router = n_layers * n_exp * hidden * router_bytes
+    router = n_layers * n_exp * hidden * side_bytes
     expert_rows = topk * (2 * inter + hidden)
     expert_codes = n_layers * topk * (2 * inter * hidden + hidden * inter) * 2 // 8
     expert_alpha = n_layers * expert_rows * 4
     head_codes = vocab * hidden * 4 // 8
-    head_scales = vocab * (hidden // group) * 4 * 2
+    head_scales = vocab * (hidden // group) * side_bytes * 2
     norms = n_layers * (2 * hidden + 2 * head_dim) * 4 + hidden * 4
     packed = (
         attn_codes
@@ -544,28 +545,33 @@ class MapleForCausalLM:
         model._load_weights(weights)
         return model
 
-    def _cast_router(self, weights: dict[str, torch.Tensor]) -> None:
-        """Hold the router in the model dtype rather than the converter's fp32.
+    #: Unquantized tensors the MLX packer keeps in the source dtype. Everything
+    #: else the converter promoted to float32 stays float32 (``row_alpha`` and
+    #: the norms are read once per row and are not worth the churn).
+    _BF16_SUFFIXES = (".mlp.gate.weight", ".scales", ".biases")
+
+    def _cast_side_tensors(self, weights: dict[str, torch.Tensor]) -> None:
+        """Hold the router and RTN scales in the model dtype, not fp32.
 
         ``maple_run.convert`` promotes every float tensor to float32 (the
         ternarizer needs float32 arithmetic). The DeepGrove MLX packer instead
-        passes non-ternary weights through untouched, so its router stays
-        bf16. At 24 layers x 256 experts x 2048 the fp32 copy is 50 MB of the
-        462 MB read per decode token; bf16 halves that for bits the reference
-        runtime never stored. Routing is unchanged in practice — the router
-        GEMV still accumulates in float32, and the top-8 selection matched the
-        fp32 path exactly on every check.
+        passes non-ternary weights through untouched and lets ``mx.quantize``
+        return scales/biases in the source dtype, so a reference checkpoint has
+        all of these in bf16. Together they are ~45 MB of the 462 MB read per
+        decode token.
 
-        Head scales/biases are deliberately *not* cast: they are read as
-        ``BLOCK_N`` contiguous elements, and bf16 turns those 128-byte loads
-        into 64-byte ones, which measured slower despite the smaller footprint.
+        This only pays off with the codes in their untransposed layout: when
+        the head codes were stored ``[nwords, N]`` the tiles wanted
+        ``BLOCK_N=32``, which turned bf16 scales into 64-byte loads and
+        measured slower. Untransposed, each row's 32 groups are contiguous and
+        bf16 wins (820 vs 903 us on the lm_head).
         """
         for key in list(weights):
-            if key.endswith(".mlp.gate.weight") and weights[key].dtype == torch.float32:
+            if weights[key].dtype == torch.float32 and key.endswith(self._BF16_SUFFIXES):
                 weights[key] = weights[key].to(self.dtype)
 
     def _load_weights(self, weights: dict[str, torch.Tensor]) -> None:
-        self._cast_router(weights)
+        self._cast_side_tensors(weights)
         rtn_group = int(
             (self.config.get("maple_run") or {})
             .get("rtn_4bit", {})
@@ -706,5 +712,5 @@ class MapleForCausalLM:
 
     def decode_traffic(self) -> dict[str, int]:
         return packed_decode_bytes(
-            self.config, router_bytes=torch.empty(0, dtype=self.dtype).element_size()
+            self.config, side_bytes=torch.empty(0, dtype=self.dtype).element_size()
         )
