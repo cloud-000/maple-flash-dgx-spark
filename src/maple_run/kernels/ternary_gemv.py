@@ -18,12 +18,17 @@ _CODES_PER_WORD = 16
 
 
 def _gemv_launch_meta(nwords: int, batch: int) -> tuple[int, int, int, int]:
-    """BLOCK_N, BLOCK_K_WORDS, warps, stages. Decode (batch=1) needs many CTAs + fat K tiles."""
+    """BLOCK_N, BLOCK_K_WORDS, warps, stages. Decode (batch=1) needs many CTAs.
+
+    K tiles wider than 64 words spill: a ``[BLOCK_N, BLOCK_K_WORDS*16]`` float32
+    ternary tile at 128 words is 64 KB per CTA. Swept L2-cold (rotating over 24
+    weight buffers, as the 24 layers do) this reaches 141 GB/s on QKV and 191
+    GB/s on O; the same sweep against one resident buffer claims far more, which
+    the in-model profile does not deliver.
+    """
     if batch == 1:
-        if nwords >= 128:
-            return 8, 128, 4, 3
         if nwords >= 64:
-            return 16, 64, 4, 4
+            return 8, 64, 2, 3
         if nwords >= 32:
             return 16, 32, 4, 4
         return 16, 8, 4, 2
@@ -63,15 +68,12 @@ def _ternary_gemv_kernel(
     shifts = (tl.arange(0, 16) * 2).to(tl.uint32)
     k_total = nwords * 16
 
-    rstd = 1.0
-    if HAS_RMS:
-        sumsq = 0.0
-        for w0 in range(0, nwords, BLOCK_K_WORDS):
-            offs_k = w0 * 16 + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < k_total
-            xt = tl.load(x_row + offs_k * stride_xk, mask=mask_k, other=0.0).to(tl.float32)
-            sumsq += tl.sum(xt * xt, axis=0)
-        rstd = tl.rsqrt(sumsq / k_total + eps)
+    # RMSNorm folded in without a pre-pass: rstd is a scalar, so
+    # sum_k T[n,k] * (x[k] * rstd * w[k]) == rstd * sum_k T[n,k] * (x[k] * w[k]).
+    # Accumulating sumsq alongside the dot product keeps the weight loads at the
+    # top of the kernel; a separate reduction loop first stalled every CTA and
+    # cost QKV ~30 GB/s (142 vs 173 with the norm removed entirely).
+    sumsq = tl.zeros((), dtype=tl.float32)
 
     for w0 in range(0, nwords, BLOCK_K_WORDS):
         offs_w = w0 + tl.arange(0, BLOCK_K_WORDS)
@@ -94,9 +96,13 @@ def _ternary_gemv_kernel(
             other=0.0,
         ).to(tl.float32)
         if HAS_RMS:
+            sumsq += tl.sum(x_tile * x_tile, axis=0)
             rms_w = tl.load(rms_w_ptr + offs_k, mask=mask_k, other=0.0).to(tl.float32)
-            x_tile = x_tile * rstd * rms_w
+            x_tile = x_tile * rms_w
         acc += tl.sum(ternary * x_tile[None, :], axis=1)
+
+    if HAS_RMS:
+        acc = acc * tl.rsqrt(sumsq / k_total + eps)
 
     alpha = tl.load(alpha_ptr + offs_n * stride_a, mask=mask_n, other=0.0).to(tl.float32)
     tl.store(

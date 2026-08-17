@@ -53,11 +53,14 @@ def _rtn4_launch_meta(nwords: int, batch: int) -> tuple[int, int, int, int]:
     ``BLOCK_K_WORDS`` is a multiple of 8 so each K-tile holds a whole number of
     RTN groups (8 uint32 = 64 codes). Decode (batch=1) uses fat K tiles; one
     group per tile was ~140 GB/s on the lm_head, four groups with per-group
-    scale/bias ~201 GB/s.
+    scale/bias ~196 GB/s. ``BLOCK_N=32`` keeps the packed-KN row load at a full
+    128-byte line, which is also why the fp32 scales/biases are left alone:
+    halving them to bf16 saves 19 MB/token but drops those loads to 64 bytes
+    and measured *slower* (155 vs 196 GB/s).
     """
     if batch == 1:
         if nwords >= 32:
-            return 32, 32, 2, 2
+            return 32, 32, 2, 4
         if nwords >= 16:
             return 32, 16, 2, 3
         return 64, 8, 2, 2
@@ -131,6 +134,10 @@ def _rtn4_gemv_kernel(
             mask=mask_n[:, None] & mask_g[None, :],
             other=0.0,
         ).to(tl.float32)
+        # Broadcasting scale/bias across the tile beats reducing q*x per group
+        # first (measured 196 vs 139 GB/s at N=151936, K=2048): the per-group
+        # reduction needs a 3-D reshape whose register layout costs more than
+        # the extra multiplies it saves.
         ones = tl.full((GROUP_SIZE,), 1.0, dtype=tl.float32)
         scale_k = tl.reshape(scale[:, :, None] * ones[None, None, :], (BLOCK_N, BLOCK_K))
         bias_k = tl.reshape(bias[:, :, None] * ones[None, None, :], (BLOCK_N, BLOCK_K))

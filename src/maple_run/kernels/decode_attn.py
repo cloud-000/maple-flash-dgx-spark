@@ -140,8 +140,9 @@ def _decode_gqa_kernel(
     k_ptr,
     v_ptr,
     out_ptr,
+    m_ptr,
+    l_ptr,
     seqlen_ptr,
-    n_q_per_kv,
     scale,
     max_len,
     stride_qh,
@@ -152,57 +153,148 @@ def _decode_gqa_kernel(
     stride_vh,
     stride_vt,
     stride_vd,
+    stride_os,
     stride_oh,
     stride_od,
+    stride_ms,
+    stride_mh,
     HEAD_DIM: tl.constexpr,
     BLOCK_T: tl.constexpr,
     WINDOW: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    SPLITS: tl.constexpr,
+    IEEE: tl.constexpr,
 ):
-    h = tl.program_id(0)
-    kv_h = h // n_q_per_kv
+    """One program per (KV head, sequence split).
+
+    All ``GROUP`` query heads sharing a KV head are scored against the same K/V
+    tile, so the cache is read once instead of once per query head. With
+    ``SPLITS > 1`` each program covers a slice of the sequence and writes
+    ``(acc, m, l)`` partials for ``_gqa_combine_kernel`` to merge.
+    """
+    kv_h = tl.program_id(0)
+    sp = tl.program_id(1)
     offs_d = tl.arange(0, HEAD_DIM)
-    q = tl.load(q_ptr + h * stride_qh + offs_d * stride_qd).to(tl.float32)
+    offs_g = tl.arange(0, BLOCK_G)
+    mask_g = offs_g < GROUP
+
+    q = tl.load(
+        q_ptr + (kv_h * GROUP + offs_g)[:, None] * stride_qh + offs_d[None, :] * stride_qd,
+        mask=mask_g[:, None],
+        other=0.0,
+    )
 
     kv_len = tl.minimum(tl.load(seqlen_ptr) + 1, max_len)
     start = 0
     if WINDOW > 0:
         start = tl.maximum(0, kv_len - WINDOW)
+    # Split the live range evenly, rounded up to whole tiles so every program's
+    # K/V loads stay tile-aligned. Trailing splits may end up empty (l == 0).
+    per = tl.cdiv(tl.cdiv(kv_len - start, SPLITS), BLOCK_T) * BLOCK_T
+    lo = start + sp * per
+    hi = tl.minimum(lo + per, kv_len)
     # Align the first tile so K/V loads stay coalesced; mask drops pad.
-    start_aligned = (start // BLOCK_T) * BLOCK_T
+    lo_aligned = (lo // BLOCK_T) * BLOCK_T
 
-    m_i = -1.0e9
-    l_i = 0.0
-    acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
-    neg = -1.0e9
+    m_i = tl.full((BLOCK_G,), -1.0e9, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_G,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_G, HEAD_DIM), dtype=tl.float32)
 
     k_row = k_ptr + kv_h * stride_kh
     v_row = v_ptr + kv_h * stride_vh
 
-    for t0 in range(start_aligned, kv_len, BLOCK_T):
+    for t0 in range(lo_aligned, hi, BLOCK_T):
         offs_t = t0 + tl.arange(0, BLOCK_T)
-        mask_t = (offs_t >= start) & (offs_t < kv_len)
+        mask_t = (offs_t >= lo) & (offs_t < hi)
         k = tl.load(
             k_row + offs_t[:, None] * stride_kt + offs_d[None, :] * stride_kd,
             mask=mask_t[:, None],
             other=0.0,
-        ).to(tl.float32)
-        scores = tl.sum(q[None, :] * k, axis=1) * scale
-        scores = tl.where(mask_t, scores, neg)
-        m_tile = tl.max(scores, axis=0)
-        m_new = tl.maximum(m_i, m_tile)
+        )
+        # Q and K are already bf16 in the decode cache, so the tensor-core dot
+        # loses nothing over an fp32 reduction of the same values and still
+        # accumulates in fp32. Broadcasting instead (a
+        # [BLOCK_G, BLOCK_T, HEAD_DIM] tile) spills. An fp32 cache would
+        # otherwise silently drop to tf32 here, so it takes the exact path.
+        if IEEE:
+            scores = tl.dot(q, tl.trans(k), input_precision="ieee") * scale
+        else:
+            scores = tl.dot(q, tl.trans(k)) * scale
+        scores = tl.where(mask_t[None, :], scores, -1.0e9)
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
         alpha = tl.exp(m_i - m_new)
-        p = tl.exp(scores - m_new)
-        p = tl.where(mask_t, p, 0.0)
-        l_i = l_i * alpha + tl.sum(p, axis=0)
+        p = tl.exp(scores - m_new[:, None])
+        p = tl.where(mask_t[None, :], p, 0.0)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
         v = tl.load(
             v_row + offs_t[:, None] * stride_vt + offs_d[None, :] * stride_vd,
             mask=mask_t[:, None],
             other=0.0,
-        ).to(tl.float32)
-        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        )
+        # P rounds to the cache dtype for the second dot, as FlashAttention does;
+        # the attention output is bf16 anyway, so this stays inside its rounding.
+        if IEEE:
+            acc = acc * alpha[:, None] + tl.dot(p, v, input_precision="ieee")
+        else:
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
-    tl.store(out_ptr + h * stride_oh + offs_d * stride_od, acc / l_i)
+    if SPLITS == 1:
+        tl.store(
+            out_ptr + (kv_h * GROUP + offs_g)[:, None] * stride_oh
+            + offs_d[None, :] * stride_od,
+            acc / l_i[:, None],
+            mask=mask_g[:, None],
+        )
+    else:
+        tl.store(
+            out_ptr
+            + sp * stride_os
+            + (kv_h * GROUP + offs_g)[:, None] * stride_oh
+            + offs_d[None, :] * stride_od,
+            acc,
+            mask=mask_g[:, None],
+        )
+        base = sp * stride_ms + (kv_h * GROUP + offs_g) * stride_mh
+        tl.store(m_ptr + base, m_i, mask=mask_g)
+        tl.store(l_ptr + base, l_i, mask=mask_g)
+
+
+@triton.jit
+def _gqa_combine_kernel(
+    part_ptr,
+    m_ptr,
+    l_ptr,
+    out_ptr,
+    stride_ps,
+    stride_ph,
+    stride_pd,
+    stride_ms,
+    stride_mh,
+    stride_oh,
+    stride_od,
+    HEAD_DIM: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    """Merge per-split ``(acc, m, l)`` partials for one query head."""
+    h = tl.program_id(0)
+    offs_d = tl.arange(0, HEAD_DIM)
+    offs_s = tl.arange(0, SPLITS)
+
+    m = tl.load(m_ptr + offs_s * stride_ms + h * stride_mh)
+    l = tl.load(l_ptr + offs_s * stride_ms + h * stride_mh)
+    # Empty splits carry l == 0; drop them so they cannot move the max.
+    m = tl.where(l > 0.0, m, -1.0e9)
+    m_max = tl.max(m, axis=0)
+    w = tl.where(l > 0.0, tl.exp(m - m_max), 0.0)
+
+    part = tl.load(
+        part_ptr + offs_s[:, None] * stride_ps + h * stride_ph + offs_d[None, :] * stride_pd
+    ).to(tl.float32)
+    acc = tl.sum(part * w[:, None], axis=0)
+    denom = tl.sum(l * w, axis=0)
+    tl.store(out_ptr + h * stride_oh + offs_d * stride_od, acc / denom)
 
 
 def apply_qkv_decode(
@@ -260,6 +352,27 @@ def apply_qkv_decode(
     return q_out
 
 
+_BLOCK_T = 64
+_MIN_SPLIT_TILES = 1
+_MAX_SPLITS = 8
+
+
+def gqa_splits(max_len: int, window: int | None) -> int:
+    """Sequence splits for the decode GQA grid.
+
+    Fixed at cache-allocation time so the launch grid is a CUDA-graph constant.
+    Only ``n_kv`` (4) programs would otherwise be resident; splitting restores
+    occupancy without re-reading K/V per query head.
+    """
+    span = max_len if window is None else min(max_len, window)
+    tiles = max(1, -(-span // _BLOCK_T))
+    # Power of two: the combine kernel indexes splits with ``tl.arange``.
+    splits = 1
+    while splits * 2 <= min(_MAX_SPLITS, max(1, tiles // _MIN_SPLIT_TILES)):
+        splits *= 2
+    return splits
+
+
 def decode_gqa_attn(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -268,8 +381,13 @@ def decode_gqa_attn(
     *,
     scale: float,
     window: int | None,
+    workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """GQA attention for ``q_len=1``. ``seqlen`` is the index just written (kv_len-1)."""
+    """GQA attention for ``q_len=1``. ``seqlen`` is the index just written (kv_len-1).
+
+    ``workspace`` holds the per-split ``(acc, m, l)`` partials; pass a
+    preallocated one so decode does not allocate inside a CUDA graph.
+    """
     if q.ndim != 4 or q.shape[0] != 1 or q.shape[2] != 1:
         raise ValueError(f"decode_gqa_attn expects q [1, H, 1, D], got {tuple(q.shape)}.")
     _, n_q, _, head_dim = q.shape
@@ -277,17 +395,34 @@ def decode_gqa_attn(
     max_len = k_cache.shape[2]
     if n_q % n_kv != 0:
         raise ValueError(f"n_q={n_q} not divisible by n_kv={n_kv}.")
+    group = n_q // n_kv
     out = torch.empty_like(q)
     q2 = q[0, :, 0, :]
     o2 = out[0, :, 0, :]
     win = 0 if window is None else int(window)
-    _decode_gqa_kernel[(n_q,)](
+    splits = gqa_splits(max_len, window)
+
+    if splits == 1:
+        part, m_buf, l_buf = o2, o2, o2
+        stride_os = stride_ms = 0
+    else:
+        if workspace is None:
+            part = torch.empty(splits, n_q, head_dim, device=q.device, dtype=torch.float32)
+            m_buf = torch.empty(splits, n_q, device=q.device, dtype=torch.float32)
+            l_buf = torch.empty(splits, n_q, device=q.device, dtype=torch.float32)
+        else:
+            part, m_buf, l_buf = workspace
+        stride_os = part.stride(0)
+        stride_ms = m_buf.stride(0)
+
+    _decode_gqa_kernel[(n_kv, splits)](
         q2,
         k_cache[0],
         v_cache[0],
-        o2,
+        part,
+        m_buf,
+        l_buf,
         seqlen,
-        n_q // n_kv,
         float(scale),
         max_len,
         q2.stride(0),
@@ -298,12 +433,36 @@ def decode_gqa_attn(
         v_cache[0].stride(0),
         v_cache[0].stride(1),
         v_cache[0].stride(2),
-        o2.stride(0),
-        o2.stride(1),
+        stride_os,
+        part.stride(-2),
+        part.stride(-1),
+        stride_ms,
+        m_buf.stride(-1),
         HEAD_DIM=head_dim,
-        BLOCK_T=64,
+        BLOCK_T=_BLOCK_T,
         WINDOW=win,
+        GROUP=group,
+        BLOCK_G=max(16, triton.next_power_of_2(group)),
+        SPLITS=splits,
+        IEEE=k_cache.dtype == torch.float32,
         num_warps=4,
         num_stages=2,
     )
+    if splits > 1:
+        _gqa_combine_kernel[(n_q,)](
+            part,
+            m_buf,
+            l_buf,
+            o2,
+            part.stride(0),
+            part.stride(1),
+            part.stride(2),
+            m_buf.stride(0),
+            m_buf.stride(1),
+            o2.stride(0),
+            o2.stride(1),
+            HEAD_DIM=head_dim,
+            SPLITS=splits,
+            num_warps=4,
+        )
     return out

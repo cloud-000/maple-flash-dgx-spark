@@ -40,10 +40,18 @@ def _expert_nk(
 
 
 def _expert_launch_meta(nwords: int) -> tuple[int, int, int, int]:
+    """BLOCK_N, BLOCK_K_WORDS, warps, stages for one selected expert.
+
+    Swept L2-cold at the Maple decode shapes (a single-buffer microbench keeps
+    the selected experts resident and overstates this by ~1.7x). Narrow tiles
+    win here: only 8 experts are selected, so ``BLOCK_N=2`` with one warp is
+    what puts enough CTAs on the machine to cover DRAM latency -- up/gate
+    ``K=2048`` 207 GB/s (against 178 at ``BLOCK_N=8``), down ``K=512`` 211.
+    """
     if nwords >= 64:
-        return 8, 64, 4, 2
+        return 2, 64, 1, 3
     if nwords >= 32:
-        return 8, 32, 4, 4
+        return 4, 32, 1, 4
     return 16, 8, 4, 2
 
 

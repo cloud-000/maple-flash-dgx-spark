@@ -12,19 +12,19 @@ from maple_run.kernels.ternary_gemv import ternary_gemv
 from maple_run.pack import HEAD_GROUP_SIZE
 
 
-def _packed_kn_2d(packed_weight):
-    """``[N, nwords]`` → ``[nwords, N]`` so consecutive output rows coalesce."""
-    return packed_weight.transpose(0, 1).contiguous()
-
-
-def _packed_kn_3d(packed_weight):
-    """``[E, N, nwords]`` → ``[E, nwords, N]``."""
-    return packed_weight.transpose(1, 2).contiguous()
-
-
 class PackedTernaryLinear:
+    """Codes stay in the checkpoint's ``[N, nwords]`` order.
+
+    Transposing to ``[nwords, N]`` puts consecutive output rows next to each
+    other, but it also scatters one CTA's K tile across ``BLOCK_K_WORDS``
+    addresses ``N * 4`` bytes apart. Read cold — which is the only way decode
+    ever reads them — the untransposed layout keeps each row's K tile
+    contiguous and measured faster on every projection: QKV 141 vs 125 GB/s,
+    O 191 vs 165, expert up/gate 178 vs 170, expert down 174 vs 167.
+    """
+
     def __init__(self, packed_weight, row_alpha):
-        self.packed_weight = _packed_kn_2d(packed_weight)
+        self.packed_weight = packed_weight.contiguous()
         self.row_alpha = row_alpha
 
     def forward(self, x, rms_weight=None, rms_eps: float = 1e-6):
@@ -34,28 +34,23 @@ class PackedTernaryLinear:
             self.row_alpha,
             rms_weight=rms_weight,
             rms_eps=rms_eps,
-            packed_kn=True,
         )
 
     __call__ = forward
 
 
 class PackedTernaryExperts:
-    """Stacked experts ``[E, nwords, N]`` after load; one fused launch over selected ids."""
+    """Stacked experts ``[E, N, nwords]``; one fused launch over selected ids."""
 
     def __init__(self, packed_weight, row_alpha):
-        self.packed_weight = _packed_kn_3d(packed_weight)
+        self.packed_weight = packed_weight.contiguous()
         self.row_alpha = row_alpha
 
     def forward(self, x, expert_ids):
-        return ternary_expert_gemv(
-            x, self.packed_weight, self.row_alpha, expert_ids, packed_kn=True
-        )
+        return ternary_expert_gemv(x, self.packed_weight, self.row_alpha, expert_ids)
 
     def swiglu(self, x, expert_ids):
-        return ternary_expert_swiglu(
-            x, self.packed_weight, self.row_alpha, expert_ids, packed_kn=True
-        )
+        return ternary_expert_swiglu(x, self.packed_weight, self.row_alpha, expert_ids)
 
     def down_sum(self, x, expert_ids, topk_weight, residual=None):
         return ternary_expert_down_sum(
@@ -65,17 +60,19 @@ class PackedTernaryExperts:
             expert_ids,
             topk_weight,
             residual=residual,
-            packed_kn=True,
         )
 
     __call__ = forward
 
 
 class PackedRTN4Linear:
+    """4-bit head, also left in the checkpoint's ``[N, nwords]`` order (215 vs
+    194 GB/s transposed; see ``PackedTernaryLinear``)."""
+
     def __init__(self, packed_weight, scales, biases, group_size: int = HEAD_GROUP_SIZE):
-        self.packed_weight = _packed_kn_2d(packed_weight)
-        self.scales = scales.transpose(0, 1).contiguous()
-        self.biases = biases.transpose(0, 1).contiguous()
+        self.packed_weight = packed_weight.contiguous()
+        self.scales = scales.contiguous()
+        self.biases = biases.contiguous()
         self.group_size = group_size
 
     def forward(self, x):
@@ -85,7 +82,6 @@ class PackedRTN4Linear:
             self.scales,
             self.biases,
             group_size=self.group_size,
-            packed_kn=True,
         )
 
     __call__ = forward

@@ -19,8 +19,9 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
 
-from maple_run.kernels.decode_attn import apply_qkv_decode, decode_gqa_attn
+from maple_run.kernels.decode_attn import apply_qkv_decode, decode_gqa_attn, gqa_splits
 from maple_run.kernels.fused_norm import add_rms_norm, moe_reduce_add, rms_norm
+from maple_run.kernels.router import router_topk
 from maple_run.linear import (
     PackedRTN4Embedding,
     PackedRTN4Linear,
@@ -117,6 +118,7 @@ class KVCache:
         batch: int,
         dtype: torch.dtype,
         device: torch.device,
+        n_heads: int | None = None,
     ):
         self.layer_types = layer_types
         self.window = window
@@ -132,6 +134,15 @@ class KVCache:
         ]
         self.seqlen = torch.zeros((), dtype=torch.int64, device=device)
         self.seen = 0
+        # Split-attention partials, shared by every layer (attention is
+        # sequential) and preallocated so decode allocates nothing per step.
+        n_heads = n_heads if n_heads is not None else n_kv
+        splits = max(gqa_splits(max_len, window), gqa_splits(max_len, None))
+        self.attn_ws = (
+            torch.empty(splits, n_heads, head_dim, dtype=torch.float32, device=device),
+            torch.empty(splits, n_heads, dtype=torch.float32, device=device),
+            torch.empty(splits, n_heads, dtype=torch.float32, device=device),
+        )
 
     def snapshot(self) -> dict:
         """CPU-side handle plus cloned K/V; used to restore after graph warmup."""
@@ -249,6 +260,7 @@ class MapleAttention:
                 cache.seqlen,
                 scale=self.scale,
                 window=self.sliding_window,
+                workspace=cache.attn_ws,
             )
             attn = attn.transpose(1, 2).reshape(bsz, q_len, -1)
             return self.o_proj(attn)
@@ -305,10 +317,7 @@ class MapleSparseMoeBlock:
     def __call__(self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         bsz, seq_len, hidden = hidden_states.shape
         x = hidden_states.reshape(-1, hidden)
-        logits = F.linear(x.float(), self.gate_weight.float())
-        routing = torch.softmax(logits, dim=-1, dtype=torch.float32)
-        scores, topk_idx = torch.topk(routing, self.top_k, dim=-1)
-        topk_weight = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_idx, topk_weight = router_topk(x, self.gate_weight, self.top_k)
 
         hidden_e = self.up_gate.swiglu(x, topk_idx)
         expert_out = self.down(hidden_e, topk_idx)
@@ -402,8 +411,13 @@ def _as_uint32(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.uint32)
 
 
-def packed_decode_bytes(config: dict) -> dict[str, int]:
-    """HBM bytes touched per decode token (weights only; KV depends on context)."""
+def packed_decode_bytes(config: dict, router_bytes: int = 2) -> dict[str, int]:
+    """HBM bytes touched per decode token (weights only; KV depends on context).
+
+    ``router_bytes`` is the element size the router weight is held in at
+    runtime; see ``MapleForCausalLM._cast_router``. Everything else unquantized
+    (``row_alpha``, RTN scales/biases, norms) stays float32 as converted.
+    """
     n_layers = int(config["num_hidden_layers"])
     hidden = int(config["hidden_size"])
     n_q = int(config["num_attention_heads"])
@@ -422,7 +436,7 @@ def packed_decode_bytes(config: dict) -> dict[str, int]:
     qkv_n = (n_q + 2 * n_kv) * head_dim
     attn_codes = n_layers * (qkv_n + hidden) * hidden // 4  # 2-bit → 4 weights/byte
     attn_alpha = n_layers * (qkv_n + hidden) * 4
-    router = n_layers * n_exp * hidden * 4
+    router = n_layers * n_exp * hidden * router_bytes
     expert_rows = topk * (2 * inter + hidden)
     expert_codes = n_layers * topk * (2 * inter * hidden + hidden * inter) * 2 // 8
     expert_alpha = n_layers * expert_rows * 4
@@ -530,7 +544,28 @@ class MapleForCausalLM:
         model._load_weights(weights)
         return model
 
+    def _cast_router(self, weights: dict[str, torch.Tensor]) -> None:
+        """Hold the router in the model dtype rather than the converter's fp32.
+
+        ``maple_run.convert`` promotes every float tensor to float32 (the
+        ternarizer needs float32 arithmetic). The DeepGrove MLX packer instead
+        passes non-ternary weights through untouched, so its router stays
+        bf16. At 24 layers x 256 experts x 2048 the fp32 copy is 50 MB of the
+        462 MB read per decode token; bf16 halves that for bits the reference
+        runtime never stored. Routing is unchanged in practice — the router
+        GEMV still accumulates in float32, and the top-8 selection matched the
+        fp32 path exactly on every check.
+
+        Head scales/biases are deliberately *not* cast: they are read as
+        ``BLOCK_N`` contiguous elements, and bf16 turns those 128-byte loads
+        into 64-byte ones, which measured slower despite the smaller footprint.
+        """
+        for key in list(weights):
+            if key.endswith(".mlp.gate.weight") and weights[key].dtype == torch.float32:
+                weights[key] = weights[key].to(self.dtype)
+
     def _load_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        self._cast_router(weights)
         rtn_group = int(
             (self.config.get("maple_run") or {})
             .get("rtn_4bit", {})
@@ -608,6 +643,7 @@ class MapleForCausalLM:
             batch=batch,
             dtype=self.dtype,
             device=self.device,
+            n_heads=self.num_heads,
         )
 
     def forward(
@@ -669,4 +705,6 @@ class MapleForCausalLM:
         return torch.cat(out, dim=-1)
 
     def decode_traffic(self) -> dict[str, int]:
-        return packed_decode_bytes(self.config)
+        return packed_decode_bytes(
+            self.config, router_bytes=torch.empty(0, dtype=self.dtype).element_size()
+        )
