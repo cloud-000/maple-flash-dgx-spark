@@ -4,11 +4,12 @@ This document is for the **next session**. The previous session diagnosed why
 `vllm serve deepgrove/maple-preview` failed on Spark, why the Hugging Face CUDA
 Transformers path is slow, and what a packed-kernel runtime has to do.
 
-**Phase 1–4 are done.** Exact-head sampled decode is ~368 tok/s. FlashHead
+**Phase 1–5 are done.** Exact-head sampled decode is ~368 tok/s. FlashHead
 (`--flash-head`) is ~487 tok/s on the 256-tok bench / ~489 tok/s on 700-tok
 haiku — the M4-class 169→218 jump, on this host. Default generate is still
-exact-head; do not regress it. Do not re-convert unless the packed checkpoint
-is missing; FlashHead clusters are already attached (`--flash-head-only`).
+exact-head; do not regress it. `maple-run serve` is an OpenAI-compatible HTTP
+endpoint. Do not re-convert unless the packed checkpoint is missing; FlashHead
+clusters are already attached (`--flash-head-only`).
 Do not start with a web search for Maple, MLX, or Spark bandwidth; read
 `docs/SOURCES.md` and `AGENTS.md` first — and read "How to measure on this host"
 below before trusting any kernel benchmark.
@@ -21,7 +22,7 @@ below before trusting any kernel benchmark.
 | 2 Packed GEMV kernel | **Done.** Triton packed GEMV in `maple_run/kernels/ternary_gemv.py`; never unpacks to dense bf16. Tests in `tests/test_ternary_gemv.py`. |
 | 3 Model decode | **Done, fused, and tuned twice.** Packed forward + fused RMS/QKV/SwiGLU/decode attn + fused router + fused sampler. Exact-head sampled **~368 tok/s** on the 256-tok bench, **~364 tok/s** on 700-tok haiku. CUDA graphs used when replay matches eager sampled ids. **Default generate path; do not regress.** |
 | 4 FlashHead | **Done.** `maple_run/flash_head.py` + indexed 4-bit GEMV. 4748 clusters / 512 probes attached on this host. Sampled **~487 tok/s** (256-tok bench) / **~489 tok/s** (700-tok haiku). Prefill stays on the exact head. CLI: `--flash-head`. Tests in `tests/test_flash_head.py`. |
-| 5 HTTP | Not started |
+| 5 HTTP | **Done.** `maple-run serve` OpenAI `/v1/chat/completions` + `/v1/completions`. |
 
 Packed checkpoint on this host (gitignored, do not commit):
 
@@ -363,7 +364,7 @@ The honest tools, in order of trust: full sampled decode timed several times
 (`tests/test_bench.py --bench`), ablation against full decode, round-robin A/B
 of launch configs, L2-cold microbench, and last a plain microbench.
 
-### Open issues (next session: optional HTTP, or more body-kernel speed)
+### Open issues (next session: more body-kernel speed)
 
 1. **QKV/O is the weakest kernel**, ~55% of achievable against ~85% for the
    lm_head and the expert SwiGLU. It is the only body GEMV with a fused input
@@ -398,15 +399,28 @@ top 512, always score force tokens. Attach with
 `maple-run convert checkpoints/maple-2bit --flash-head-only` (already run).
 Enable at decode with `--flash-head`. Default generate stays exact-head.
 
-### Phase 5 — HTTP (optional)
+### Phase 5 — HTTP — **done**
 
-Only after packed decode works. Do not start here.
+OpenAI-compatible stdlib server. Same sampling flags as `generate` are CLI
+defaults; the request body may override them (`temperature`, `top_p`, `top_k`,
+`max_tokens` / `max_completion_tokens`, `seed`, `stream`).
+
+```bash
+uv run maple-run serve --model checkpoints/maple-2bit --host 127.0.0.1 --port 8000
+uv run maple-run serve --model checkpoints/maple-2bit --flash-head \
+  --temperature 1.0 --top-p 0.95 --top-k 20 --max-tokens 128
+```
+
+Endpoints: `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`.
+One CUDA generate at a time. Prefill stays on the exact head. Do not regress
+the CLI generate path.
 
 ## Scaffold map
 
 | Path | Role |
 |---|---|
-| `src/maple_run/cli.py` | `convert` / `generate` subcommands |
+| `src/maple_run/cli.py` | `convert` / `generate` / `serve` subcommands |
+| `src/maple_run/server.py` | OpenAI-compatible HTTP (`/v1/chat/completions`) |
 | `src/maple_run/pack.py` | CPU ternarize + pack_2bit + 4-bit RTN |
 | `src/maple_run/convert.py` | Streaming HF → packed safetensors |
 | `src/maple_run/kernels/ternary_gemv.py` | Packed GEMV (Triton); decode tiles pinned |
@@ -422,6 +436,7 @@ Only after packed decode works. Do not start here.
 | `src/maple_run/generate.py` | Tokenizer + greedy/sampled decode + tok/s |
 | `tests/test_bench.py` | Sampled decode speed (`pytest --bench`); FlashHead when attached |
 | `tests/test_flash_head.py` | Clustering, exact-when-all-probes, prefill stays exact |
+| `tests/test_server.py` | OpenAI request parsing, CLI `serve` flags, fake-engine HTTP |
 | `docs/sources/mlx_lm_ternary.py` | **Authoritative packer** (DeepGrove, MIT) |
 | `docs/sources/mlx_lm_deepgrove_README.md` | MLX runtime README |
 | `docs/sources/maple-preview-config.json` | HF `config.json` copy |

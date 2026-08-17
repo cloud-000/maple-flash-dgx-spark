@@ -31,6 +31,9 @@ hardware numbers. Vendored algorithm source is `docs/sources/mlx_lm_ternary.py`.
 4. **FlashHead** (`maple_run/flash_head.py`): **done.** `--flash-head` scores
    4748 centroids then exact logits for 512 clusters (~487 tok/s). Clusters
    are attached on `checkpoints/maple-2bit`. Prefill stays exact.
+5. **HTTP** (`maple_run/server.py`): **done.** `maple-run serve` is an
+   OpenAI-compatible `/v1/chat/completions` endpoint. Same sampling flags as
+   `generate` are CLI defaults; the request body may override them.
 
 Stop at the phase the user asked for. Do not skip packing tests to jump to a
 server.

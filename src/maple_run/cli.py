@@ -8,6 +8,51 @@ import sys
 from maple_run import __version__
 
 
+def _add_sampling_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Softmax temperature (default 1.0). 0 is greedy argmax",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.95,
+        help="Nucleus sampling cutoff after top-k (default 0.95)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=20,
+        help="Keep the top-k softmax tokens before nucleus (default 20). 1 is greedy",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="CUDA generator seed for sampling (ignored when greedy)",
+    )
+    parser.add_argument(
+        "--flash-head",
+        action="store_true",
+        help="Approximate lm_head: score cluster centroids, then exact logits "
+        "for the top 512 clusters (requires --flash-head-only on the checkpoint)",
+    )
+
+
+def _validate_sampling_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.temperature < 0:
+        parser.error("--temperature must be >= 0")
+    if args.top_p <= 0 or args.top_p > 1:
+        parser.error("--top-p must be in (0, 1]")
+    if args.top_k < 0:
+        parser.error("--top-k must be >= 0")
+    if args.max_tokens < 0:
+        parser.error("--max-tokens must be >= 0")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="maple-run",
@@ -64,37 +109,25 @@ def main(argv: list[str] | None = None) -> int:
     generate = sub.add_parser("generate", help="Decode from a packed checkpoint")
     generate.add_argument("--model", required=True, help="Packed checkpoint directory")
     generate.add_argument("--prompt", required=True)
-    generate.add_argument("--max-tokens", type=int, default=128)
-    generate.add_argument(
-        "--temperature",
-        type=float,
-        default=1.0,
-        help="Softmax temperature (default 1.0). 0 is greedy argmax",
+    _add_sampling_args(generate)
+
+    serve = sub.add_parser(
+        "serve",
+        help="OpenAI-compatible HTTP server for a packed checkpoint",
     )
-    generate.add_argument(
-        "--top-p",
-        type=float,
-        default=0.95,
-        help="Nucleus sampling cutoff after top-k (default 0.95)",
+    serve.add_argument("--model", required=True, help="Packed checkpoint directory")
+    serve.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address (default 127.0.0.1; use 0.0.0.0 to listen on all interfaces)",
     )
-    generate.add_argument(
-        "--top-k",
+    serve.add_argument(
+        "--port",
         type=int,
-        default=20,
-        help="Keep the top-k softmax tokens before nucleus (default 20). 1 is greedy",
+        default=8000,
+        help="Bind port (default 8000)",
     )
-    generate.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="CUDA generator seed for sampling (ignored when greedy)",
-    )
-    generate.add_argument(
-        "--flash-head",
-        action="store_true",
-        help="Approximate lm_head: score cluster centroids, then exact logits "
-        "for the top 512 clusters (requires --flash-head-only on the checkpoint)",
-    )
+    _add_sampling_args(serve)
 
     args = parser.parse_args(argv)
     if args.cmd == "convert":
@@ -128,12 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
     if args.cmd == "generate":
-        if args.temperature < 0:
-            parser.error("--temperature must be >= 0")
-        if args.top_p <= 0 or args.top_p > 1:
-            parser.error("--top-p must be in (0, 1]")
-        if args.top_k < 0:
-            parser.error("--top-k must be >= 0")
+        _validate_sampling_args(parser, args)
         from maple_run.generate import generate
 
         generate(
@@ -143,6 +171,24 @@ def main(argv: list[str] | None = None) -> int:
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
+            seed=args.seed,
+            flash_head=args.flash_head,
+        )
+        return 0
+    if args.cmd == "serve":
+        _validate_sampling_args(parser, args)
+        if args.port < 0 or args.port > 65535:
+            parser.error("--port must be in 0..65535")
+        from maple_run.server import serve
+
+        serve(
+            args.model,
+            host=args.host,
+            port=args.port,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            max_tokens=args.max_tokens,
             seed=args.seed,
             flash_head=args.flash_head,
         )

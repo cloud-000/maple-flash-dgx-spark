@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import time
 import warnings
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -24,6 +25,8 @@ class GenerateResult:
     n_new: int
     prefill_s: float
     decode_s: float
+    token_ids: list[int] = field(default_factory=list)
+    finish_reason: str = "stop"
 
     @property
     def decode_tok_s(self) -> float:
@@ -32,6 +35,10 @@ class GenerateResult:
     @property
     def prefill_tok_s(self) -> float:
         return self.prompt_len / self.prefill_s if self.prefill_s > 0 else 0.0
+
+
+def _log_print(msg: str) -> None:
+    print(msg, flush=True)
 
 
 def is_greedy(temperature: float, top_k: int) -> bool:
@@ -216,6 +223,7 @@ def _try_decode_graph(
     top_k: int,
     generator: torch.Generator | None,
     sampler_ws: tuple[torch.Tensor, ...] | None = None,
+    log: Callable[[str], None] = _log_print,
 ) -> _DecodeGraph | None:
     """Capture a decode graph; keep it only if replay matches eager token ids."""
     snap = cache.snapshot()
@@ -224,7 +232,7 @@ def _try_decode_graph(
         captured = _capture_decode_graph(model, cache, token_ids)
     except Exception as exc:
         cache.restore(snap)
-        print(f"CUDA graph capture failed ({exc}); using eager decode", flush=True)
+        log(f"CUDA graph capture failed ({exc}); using eager decode")
         return None
     cache.restore(snap)
 
@@ -271,77 +279,97 @@ def _try_decode_graph(
     _rng_restore(model.device, rng_state, generator)
 
     if eager_ids != graph_ids:
-        print(
+        log(
             f"CUDA graph replay diverged (eager {eager_ids[:8]} vs graph "
-            f"{graph_ids[:8]}); using eager decode",
-            flush=True,
+            f"{graph_ids[:8]}); using eager decode"
         )
         return None
-    print("CUDA graph decode: replay matches eager sampled ids", flush=True)
+    log("CUDA graph decode: replay matches eager sampled ids")
     return captured
 
 
-def generate(
-    model_dir: str,
-    prompt: str,
-    max_tokens: int = 128,
-    temperature: float = DEFAULT_TEMPERATURE,
-    top_p: float = DEFAULT_TOP_P,
-    top_k: int = DEFAULT_TOP_K,
-    seed: int | None = None,
-    flash_head: bool = False,
-) -> GenerateResult:
-    """Load a packed checkpoint, decode, print text and tok/s."""
+def load_packed(model_dir: str, flash_head: bool = False):
+    """Load a packed Maple checkpoint and its tokenizer."""
     from transformers import AutoTokenizer
 
     from maple_run.model import MapleForCausalLM
 
     model_dir = str(Path(model_dir).expanduser())
-    print(f"Loading packed model from {model_dir}", flush=True)
     model = MapleForCausalLM.from_packed(model_dir, use_flash_head=flash_head)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="You are using a model of type")
         tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+    return model, tokenizer
+
+
+def message_text(content) -> str:
+    """Flatten OpenAI message content (string or text parts) to a string."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type", "text") == "text":
+                parts.append(str(item.get("text") or ""))
+            else:
+                raise ValueError("Only text message content is supported.")
+        return "".join(parts)
+    raise ValueError("message content must be a string or a list of text parts.")
+
+
+def _to_input_ids(encoded, device) -> torch.Tensor:
+    input_ids = encoded if torch.is_tensor(encoded) else encoded["input_ids"]
+    return input_ids.to(device).long()
+
+
+def encode_messages(tokenizer, messages: list[dict], device) -> torch.Tensor:
+    """Apply the chat template, or concatenate roles if the tokenizer has none."""
+    cleaned = [
+        {"role": str(m["role"]), "content": message_text(m.get("content"))}
+        for m in messages
+    ]
     if getattr(tokenizer, "chat_template", None):
         encoded = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
+            cleaned,
             add_generation_prompt=True,
             return_tensors="pt",
         )
-        input_ids = encoded if torch.is_tensor(encoded) else encoded["input_ids"]
-    else:
-        input_ids = tokenizer.encode(
-            prompt, add_special_tokens=False, return_tensors="pt"
-        )
-    input_ids = input_ids.to(model.device).long()
-    prompt_len = int(input_ids.shape[-1])
-
-    traffic = model.decode_traffic()
-    packed_mb = traffic["packed_weight_bytes"] / 1e6
-    unpacked_mb = traffic["unpacked_bf16_bytes"] / 1e6
-    print(
-        f"Decode weight traffic: {packed_mb:.0f} MB/token packed vs "
-        f"{unpacked_mb:.0f} MB/token unpacked bf16 "
-        f"(handoff ~{traffic['unpacked_handoff_bytes'] / 1e9:.1f} GB/token)",
-        flush=True,
+        return _to_input_ids(encoded, device)
+    prompt = "\n".join(f"{m['role']}: {m['content']}" for m in cleaned)
+    return _to_input_ids(
+        tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt"),
+        device,
     )
-    if flash_head:
-        meta = model.config.get("flash_head") or {}
-        print(
-            f"FlashHead: {meta.get('n_clusters')} clusters, "
-            f"{meta.get('n_probes')} probes, force={meta.get('force_tokens')}",
-            flush=True,
-        )
 
+
+def encode_prompt(tokenizer, prompt: str, device) -> torch.Tensor:
+    """Encode a raw completion prompt (no chat template)."""
+    return _to_input_ids(
+        tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt"),
+        device,
+    )
+
+
+def encode_user_prompt(tokenizer, prompt: str, device) -> torch.Tensor:
+    """Encode a CLI-style user string through the chat template."""
+    return encode_messages(
+        tokenizer, [{"role": "user", "content": prompt}], device
+    )
+
+
+def warmup_model(model, flash_head: bool = False) -> None:
+    """JIT the decode (and exact-head prefill) kernels."""
     with torch.inference_mode():
-        # JIT decode kernels (q_len=1 path) before the timed run.
         model.forward(
             torch.zeros(1, 1, dtype=torch.long, device=model.device),
             cache=model.make_cache(max_len=8),
             logits_to_keep=1,
         )
         if flash_head:
-            # Prefill still uses the exact lm_head (seq_len != 1).
             model.forward(
                 torch.zeros(1, 2, dtype=torch.long, device=model.device),
                 cache=model.make_cache(max_len=8),
@@ -349,6 +377,46 @@ def generate(
             )
         torch.cuda.synchronize()
 
+
+def log_model_traffic(model, flash_head: bool = False, log: Callable[[str], None] = _log_print) -> None:
+    traffic = model.decode_traffic()
+    packed_mb = traffic["packed_weight_bytes"] / 1e6
+    unpacked_mb = traffic["unpacked_bf16_bytes"] / 1e6
+    log(
+        f"Decode weight traffic: {packed_mb:.0f} MB/token packed vs "
+        f"{unpacked_mb:.0f} MB/token unpacked bf16 "
+        f"(handoff ~{traffic['unpacked_handoff_bytes'] / 1e9:.1f} GB/token)"
+    )
+    if flash_head:
+        meta = model.config.get("flash_head") or {}
+        log(
+            f"FlashHead: {meta.get('n_clusters')} clusters, "
+            f"{meta.get('n_probes')} probes, force={meta.get('force_tokens')}"
+        )
+
+
+def run_generate(
+    model,
+    tokenizer,
+    input_ids: torch.Tensor,
+    *,
+    max_tokens: int = 128,
+    temperature: float = DEFAULT_TEMPERATURE,
+    top_p: float = DEFAULT_TOP_P,
+    top_k: int = DEFAULT_TOP_K,
+    seed: int | None = None,
+    log: Callable[[str], None] | None = _log_print,
+    on_token: Callable[[int], None] | None = None,
+) -> GenerateResult:
+    """Decode from ``input_ids`` on an already-loaded packed model."""
+    def emit(msg: str) -> None:
+        if log is not None:
+            log(msg)
+
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+    input_ids = input_ids.to(model.device).long()
+    prompt_len = int(input_ids.shape[-1])
     greedy = is_greedy(temperature, top_k)
     generator = None
     if seed is not None and not greedy:
@@ -358,16 +426,20 @@ def generate(
     if can_fuse_sampler(temperature, top_p, top_k):
         sampler_ws = sampler_workspace(model.vocab_size, top_k, model.device)
     if not greedy:
-        print(
+        emit(
             f"Sampling: temperature={temperature} top_p={top_p} "
             f"top_k={top_k} seed={seed} "
-            f"({'fused' if sampler_ws is not None else 'torch'} sampler)",
-            flush=True,
+            f"({'fused' if sampler_ws is not None else 'torch'} sampler)"
         )
 
-    cache = model.make_cache(max_len=prompt_len + max_tokens)
+    cache = model.make_cache(max_len=prompt_len + max(max_tokens, 1))
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    t_prefill = t0
+    t_decode = t0
+    t_end = t0
+    new_tokens: list[int] = []
+    hit_eos = False
     with torch.inference_mode():
         logits = model.forward(input_ids, cache=cache, logits_to_keep=1)
         torch.cuda.synchronize()
@@ -384,11 +456,11 @@ def generate(
                 top_k=top_k,
                 generator=generator,
                 sampler_ws=sampler_ws,
+                log=emit,
             )
             torch.cuda.synchronize()
         t_decode = time.perf_counter()
         eos = model.eos_token_id
-        new_tokens: list[int] = []
         pinned = torch.empty((), dtype=torch.long, pin_memory=True)
         eos_ready = torch.cuda.Event()
         for i in range(max_tokens):
@@ -415,7 +487,10 @@ def generate(
             eos_ready.synchronize()
             next_id = int(pinned.item())
             new_tokens.append(next_id)
+            if on_token is not None:
+                on_token(next_id)
             if eos is not None and next_id == int(eos):
+                hit_eos = True
                 break
         torch.cuda.synchronize()
         t_end = time.perf_counter()
@@ -424,24 +499,55 @@ def generate(
     decode_s = t_end - t_decode
     n_new = len(new_tokens)
     if prompt_len and prefill_s > 0:
-        print(
+        emit(
             f"Prefill: {prompt_len} tok in {prefill_s:.2f}s "
-            f"({prompt_len / prefill_s:.1f} tok/s)",
-            flush=True,
+            f"({prompt_len / prefill_s:.1f} tok/s)"
         )
     if n_new and decode_s > 0:
-        print(
+        emit(
             f"Decode:  {n_new} tok in {decode_s:.2f}s "
-            f"({n_new / decode_s:.1f} tok/s)",
-            flush=True,
+            f"({n_new / decode_s:.1f} tok/s)"
         )
 
     text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-    print(text, flush=True)
+    finish_reason = "stop" if hit_eos else "length"
     return GenerateResult(
         text=text,
         prompt_len=prompt_len,
         n_new=n_new,
         prefill_s=prefill_s,
         decode_s=decode_s,
+        token_ids=new_tokens,
+        finish_reason=finish_reason,
     )
+
+
+def generate(
+    model_dir: str,
+    prompt: str,
+    max_tokens: int = 128,
+    temperature: float = DEFAULT_TEMPERATURE,
+    top_p: float = DEFAULT_TOP_P,
+    top_k: int = DEFAULT_TOP_K,
+    seed: int | None = None,
+    flash_head: bool = False,
+) -> GenerateResult:
+    """Load a packed checkpoint, decode, print text and tok/s."""
+    model_dir = str(Path(model_dir).expanduser())
+    print(f"Loading packed model from {model_dir}", flush=True)
+    model, tokenizer = load_packed(model_dir, flash_head=flash_head)
+    log_model_traffic(model, flash_head=flash_head)
+    warmup_model(model, flash_head=flash_head)
+    input_ids = encode_user_prompt(tokenizer, prompt, model.device)
+    result = run_generate(
+        model,
+        tokenizer,
+        input_ids,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        seed=seed,
+    )
+    print(result.text, flush=True)
+    return result
