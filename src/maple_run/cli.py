@@ -25,12 +25,40 @@ def main(argv: list[str] | None = None) -> int:
         help="Hugging Face repo id (uses the local hub cache if present) "
         "or a checkpoint directory",
     )
-    convert.add_argument("-o", "--output", required=True, help="Output directory")
+    convert.add_argument("-o", "--output", default=None, help="Output directory")
     convert.add_argument(
         "--threshold-scale",
         type=float,
         default=0.7,
         help="Ternarization threshold scale (DeepGrove default 0.7)",
+    )
+    convert.add_argument(
+        "--flash-head",
+        action="store_true",
+        help="After conversion, cluster the lm_head and attach FlashHead data",
+    )
+    convert.add_argument(
+        "--flash-head-only",
+        action="store_true",
+        help="Treat source as an already-packed directory; only attach FlashHead",
+    )
+    convert.add_argument(
+        "--clusters",
+        type=int,
+        default=4748,
+        help="FlashHead clusters (must divide vocab size; default 4748)",
+    )
+    convert.add_argument(
+        "--probes",
+        type=int,
+        default=512,
+        help="FlashHead probes per token (default 512)",
+    )
+    convert.add_argument(
+        "--kmeans-iters",
+        type=int,
+        default=60,
+        help="FlashHead k-means iterations (default 60)",
     )
 
     generate = sub.add_parser("generate", help="Decode from a packed checkpoint")
@@ -61,14 +89,43 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="CUDA generator seed for sampling (ignored when greedy)",
     )
+    generate.add_argument(
+        "--flash-head",
+        action="store_true",
+        help="Approximate lm_head: score cluster centroids, then exact logits "
+        "for the top 512 clusters (requires --flash-head-only on the checkpoint)",
+    )
 
     args = parser.parse_args(argv)
     if args.cmd == "convert":
+        if args.flash_head_only and args.flash_head:
+            parser.error("use --flash-head-only or --flash-head, not both")
+        if args.flash_head_only:
+            from maple_run.flash_head import generate_flash_head
+
+            generate_flash_head(
+                args.source,
+                n_clusters=args.clusters,
+                n_iter=args.kmeans_iters,
+                n_probes=args.probes,
+            )
+            return 0
+        if args.output is None:
+            parser.error("--output is required")
         from maple_run.convert import convert_checkpoint
 
         convert_checkpoint(
             args.source, args.output, threshold_scale=args.threshold_scale
         )
+        if args.flash_head:
+            from maple_run.flash_head import generate_flash_head
+
+            generate_flash_head(
+                args.output,
+                n_clusters=args.clusters,
+                n_iter=args.kmeans_iters,
+                n_probes=args.probes,
+            )
         return 0
     if args.cmd == "generate":
         if args.temperature < 0:
@@ -87,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             top_p=args.top_p,
             top_k=args.top_k,
             seed=args.seed,
+            flash_head=args.flash_head,
         )
         return 0
     parser.error(f"unknown command {args.cmd}")

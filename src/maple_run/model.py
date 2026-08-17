@@ -412,13 +412,16 @@ def _as_uint32(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.uint32)
 
 
-def packed_decode_bytes(config: dict, side_bytes: int = 2) -> dict[str, int]:
+def packed_decode_bytes(
+    config: dict, side_bytes: int = 2, *, flash_head: bool = False
+) -> dict[str, int]:
     """HBM bytes touched per decode token (weights only; KV depends on context).
 
     ``side_bytes`` is the element size the router weight and the RTN
     scales/biases are held in at runtime; see
     ``MapleForCausalLM._cast_side_tensors``. ``row_alpha`` and the norms stay
-    float32 as converted.
+    float32 as converted. ``flash_head`` swaps the full 4-bit lm_head for
+    centroid traffic plus the probed cluster rows.
     """
     n_layers = int(config["num_hidden_layers"])
     hidden = int(config["hidden_size"])
@@ -442,8 +445,17 @@ def packed_decode_bytes(config: dict, side_bytes: int = 2) -> dict[str, int]:
     expert_rows = topk * (2 * inter + hidden)
     expert_codes = n_layers * topk * (2 * inter * hidden + hidden * inter) * 2 // 8
     expert_alpha = n_layers * expert_rows * 4
-    head_codes = vocab * hidden * 4 // 8
-    head_scales = vocab * (hidden // group) * side_bytes * 2
+    meta = config.get("flash_head") or (config.get("maple_run") or {}).get("flash_head")
+    if flash_head and meta:
+        n_clusters = int(meta["n_clusters"])
+        n_probes = int(meta.get("n_probes", 512))
+        cluster_size = int(meta["cluster_size"])
+        n_force = len(meta.get("force_tokens") or [])
+        head_rows = n_clusters + n_probes * cluster_size + n_force
+    else:
+        head_rows = vocab
+    head_codes = head_rows * hidden * 4 // 8
+    head_scales = head_rows * (hidden // group) * side_bytes * 2
     norms = n_layers * (2 * hidden + 2 * head_dim) * 4 + hidden * 4
     packed = (
         attn_codes
@@ -494,6 +506,7 @@ class MapleForCausalLM:
         self.layers: list[MapleDecoderLayer] = []
         self.norm = None
         self.lm_head = None
+        self.lm_head_flash = None
         self.rotary = MapleRotaryEmbedding(
             self.head_dim,
             float(config.get("partial_rotary_factor", 0.5)),
@@ -508,6 +521,7 @@ class MapleForCausalLM:
         *,
         device: str | torch.device = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        use_flash_head: bool = False,
     ):
         model_dir = Path(model_dir).expanduser()
         config = json.loads((model_dir / "config.json").read_text())
@@ -516,6 +530,13 @@ class MapleForCausalLM:
             device = torch.device(device)
         if device.type != "cuda":
             raise RuntimeError("MapleForCausalLM packed decode requires CUDA.")
+        if use_flash_head and not (
+            config.get("flash_head") or (config.get("maple_run") or {}).get("flash_head")
+        ):
+            raise ValueError(
+                "Checkpoint has no FlashHead clusters. Attach them with "
+                "`maple-run convert --flash-head-only` on the packed directory."
+            )
 
         index_path = model_dir / "model.safetensors.index.json"
         if index_path.exists():
@@ -525,10 +546,17 @@ class MapleForCausalLM:
             shards = sorted(p.name for p in model_dir.glob("*.safetensors"))
         weights: dict[str, torch.Tensor] = {}
         for name in shards:
+            if not use_flash_head and name == "model-flashhead.safetensors":
+                continue
             shard = load_file(str(model_dir / name), device=str(device))
+            if not use_flash_head:
+                for key in [k for k in shard if k.startswith("lm_head_flash.")]:
+                    del shard[key]
             weights.update(shard)
 
-        return cls.from_weight_dict(config, weights, device=device, dtype=dtype)
+        return cls.from_weight_dict(
+            config, weights, device=device, dtype=dtype, use_flash_head=use_flash_head
+        )
 
     @classmethod
     def from_weight_dict(
@@ -538,12 +566,13 @@ class MapleForCausalLM:
         *,
         device: str | torch.device = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        use_flash_head: bool = False,
     ):
         _require_packed_format(config)
         if isinstance(device, str):
             device = torch.device(device)
         model = cls(config, device=device, dtype=dtype)
-        model._load_weights(weights)
+        model._load_weights(weights, use_flash_head=use_flash_head)
         return model
 
     #: Unquantized tensors the MLX packer keeps in the source dtype. Everything
@@ -571,7 +600,9 @@ class MapleForCausalLM:
             if weights[key].dtype == torch.float32 and key.endswith(self._BF16_SUFFIXES):
                 weights[key] = weights[key].to(self.dtype)
 
-    def _load_weights(self, weights: dict[str, torch.Tensor]) -> None:
+    def _load_weights(
+        self, weights: dict[str, torch.Tensor], *, use_flash_head: bool = False
+    ) -> None:
         self._cast_side_tensors(weights)
         rtn_group = int(
             (self.config.get("maple_run") or {})
@@ -590,6 +621,20 @@ class MapleForCausalLM:
             weights.pop("lm_head.biases"),
             group_size=rtn_group,
         )
+        if use_flash_head:
+            from maple_run.flash_head import build_flash_head
+
+            self.lm_head_flash = build_flash_head(
+                config=self.config,
+                lm_head=self.lm_head,
+                weights=weights,
+                device=self.device,
+                dtype=self.dtype,
+            )
+        else:
+            self.lm_head_flash = None
+            for key in [k for k in weights if k.startswith("lm_head_flash.")]:
+                weights.pop(key)
         self.norm = MapleRMSNorm(weights.pop("model.norm.weight"), self.rms_eps)
 
         layers = []
@@ -688,6 +733,12 @@ class MapleForCausalLM:
         hidden = self.norm(hidden)
         if logits_to_keep:
             hidden = hidden[:, -logits_to_keep:, :]
+        if (
+            self.lm_head_flash is not None
+            and hidden.shape[0] == 1
+            and seq_len == 1
+        ):
+            return self.lm_head_flash(hidden)
         return self.lm_head(hidden)
 
     @torch.inference_mode()
@@ -713,5 +764,7 @@ class MapleForCausalLM:
 
     def decode_traffic(self) -> dict[str, int]:
         return packed_decode_bytes(
-            self.config, side_bytes=torch.empty(0, dtype=self.dtype).element_size()
+            self.config,
+            side_bytes=torch.empty(0, dtype=self.dtype).element_size(),
+            flash_head=self.lm_head_flash is not None,
         )

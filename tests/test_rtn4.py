@@ -94,6 +94,38 @@ def test_rtn4_gemv_fat_k_tile_matches_dequantized_linear():
 
 
 @cuda
+def test_rtn4_indexed_gemv_matches_gathered_rows():
+    from maple_run.kernels.rtn4 import rtn4_gemv, rtn4_indexed_gemv
+
+    rng = np.random.default_rng(4)
+    n_clusters, cluster_size, hidden = 4, 8, 128
+    n_probes = 2
+    weight = rng.standard_normal((n_clusters * cluster_size, hidden)).astype(np.float32)
+    packed, scales, biases = quantize_rtn(weight)
+    packed_t = torch.from_numpy(np.ascontiguousarray(packed)).cuda().to(torch.uint32)
+    scales_t = torch.from_numpy(np.ascontiguousarray(scales)).cuda()
+    biases_t = torch.from_numpy(np.ascontiguousarray(biases)).cuda()
+    head_w = packed_t.reshape(n_clusters, cluster_size, -1).contiguous()
+    head_s = scales_t.reshape(n_clusters, cluster_size, -1).contiguous()
+    head_b = biases_t.reshape(n_clusters, cluster_size, -1).contiguous()
+    cluster_ids = torch.tensor([3, 0], device="cuda", dtype=torch.int32)
+    x = torch.from_numpy(rng.standard_normal((2, hidden)).astype(np.float32)).cuda()
+    y = rtn4_indexed_gemv(x, head_w, head_s, head_b, cluster_ids)
+    order = cluster_ids.long()[:, None] * cluster_size + torch.arange(
+        cluster_size, device="cuda"
+    )
+    order = order.reshape(-1)
+    y_ref = rtn4_gemv(
+        x,
+        packed_t.view(torch.int32).index_select(0, order).view(torch.uint32),
+        scales_t.index_select(0, order),
+        biases_t.index_select(0, order),
+    )
+    torch.testing.assert_close(y, y_ref, rtol=1e-4, atol=1e-4)
+    assert y.shape == (2, n_probes * cluster_size)
+
+
+@cuda
 def test_rtn4_gemv_rejects_dense_weight():
     from maple_run.kernels.rtn4 import rtn4_gemv
 

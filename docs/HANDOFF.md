@@ -4,23 +4,23 @@ This document is for the **next session**. The previous session diagnosed why
 `vllm serve deepgrove/maple-preview` failed on Spark, why the Hugging Face CUDA
 Transformers path is slow, and what a packed-kernel runtime has to do.
 
-**Phase 1–3 are done, including two tuning passes.** Sampled decode is at
-~368 tok/s, past the M4-scaled target computed against the bandwidth this host
-actually delivers (~352) and ~5% short of the 386 computed against the spec
-sheet. Next session is still **more exact-head decode speed**, not FlashHead,
-until the user asks. Do not re-convert unless the packed checkpoint is missing.
+**Phase 1–4 are done.** Exact-head sampled decode is ~368 tok/s. FlashHead
+(`--flash-head`) is ~487 tok/s on the 256-tok bench / ~489 tok/s on 700-tok
+haiku — the M4-class 169→218 jump, on this host. Default generate is still
+exact-head; do not regress it. Do not re-convert unless the packed checkpoint
+is missing; FlashHead clusters are already attached (`--flash-head-only`).
 Do not start with a web search for Maple, MLX, or Spark bandwidth; read
 `docs/SOURCES.md` and `AGENTS.md` first — and read "How to measure on this host"
 below before trusting any kernel benchmark.
 
-## Status (2026-08-16)
+## Status (2026-08-17)
 
 | Phase | State |
 |---|---|
 | 1 Pack / convert | **Done.** NumPy `ternarize` / `pack_2bit` / 4-bit RTN; streaming converter; tests in `tests/test_pack.py` and `tests/test_convert.py`. |
 | 2 Packed GEMV kernel | **Done.** Triton packed GEMV in `maple_run/kernels/ternary_gemv.py`; never unpacks to dense bf16. Tests in `tests/test_ternary_gemv.py`. |
-| 3 Model decode | **Done, fused, and tuned twice.** Packed forward + fused RMS/QKV/SwiGLU/decode attn + fused router + fused sampler. Exact-head sampled **~368 tok/s** on the 256-tok bench, **~364 tok/s** on 700-tok haiku (was 254/234). CUDA graphs used when replay matches eager sampled ids. |
-| 4 FlashHead | **Do not start** until the user asks. Exact-head body/head kernels first. |
+| 3 Model decode | **Done, fused, and tuned twice.** Packed forward + fused RMS/QKV/SwiGLU/decode attn + fused router + fused sampler. Exact-head sampled **~368 tok/s** on the 256-tok bench, **~364 tok/s** on 700-tok haiku. CUDA graphs used when replay matches eager sampled ids. **Default generate path; do not regress.** |
+| 4 FlashHead | **Done.** `maple_run/flash_head.py` + indexed 4-bit GEMV. 4748 clusters / 512 probes attached on this host. Sampled **~487 tok/s** (256-tok bench) / **~489 tok/s** (700-tok haiku). Prefill stays on the exact head. CLI: `--flash-head`. Tests in `tests/test_flash_head.py`. |
 | 5 HTTP | Not started |
 
 Packed checkpoint on this host (gitignored, do not commit):
@@ -239,7 +239,8 @@ weights as uint32 + `row_alpha`, and runs:
   (`kernels/router.py`). The torch chain it replaced was eight launches per
   layer over a 256-wide vector and cost 633 us/token — more than the router
   weight traffic itself
-- 4-bit RTN embedding gather + `rtn4_gemv` exact `lm_head` (FlashHead is phase 4)
+- 4-bit RTN embedding gather + `rtn4_gemv` exact `lm_head`; optional FlashHead
+  (`--flash-head`) scores 4748 centroids then exact logits for 512 clusters
 - `fused_sample`: top-k + temperature + nucleus + CDF inverse in two launches
   (`kernels/sampler.py`), replacing ~10 eager launches outside the graph
 - Chat-template generate. CLI defaults are sampled: `--temperature 1.0 --top-p 0.95 --top-k 20`. Greedy is `--temperature 0`.
@@ -257,6 +258,14 @@ Speed command (do not use greedy France for tok/s):
 
 ```bash
 uv run maple-run generate --model checkpoints/maple-2bit \
+  --prompt "Write a haiku on groves" --max-tokens 700
+```
+
+FlashHead (clusters already attached on this host):
+
+```bash
+uv run maple-run convert checkpoints/maple-2bit --flash-head-only   # already done
+uv run maple-run generate --model checkpoints/maple-2bit --flash-head \
   --prompt "Write a haiku on groves" --max-tokens 700
 ```
 
@@ -278,9 +287,23 @@ Measured on this GB10 host (2026-08-17), exact 4-bit head, no FlashHead:
 | Decode **sampled** T=1.0 top-p=0.95 top-k=20 (haiku, 700 tok) | **~364 tok/s** (was 234) |
 | Decode greedy France 42 tok EOS (not a speed bench) | ~390 tok/s; still prints Paris |
 
+FlashHead (`--flash-head`), same host, clusters already attached:
+
+| | |
+|---|---|
+| Packed weight traffic | **267 MB/token** (centroids + 512×32 probed rows, not the 152 k head) |
+| Decode **sampled** (haiku, 256 tok bench) | **~487 tok/s** |
+| Decode **sampled** (haiku, 700 tok) | **~489 tok/s** |
+| Decode greedy France (not a speed bench) | still prints Paris; force tokens EOS / `</think>` / `<|im_end|>` |
+
+Default generate is exact-head. Do not regress the ~368 tok/s path. FlashHead
+is opt-in and approximate: greedy is exact when the true argmax is in a probed
+cluster. Prefill always uses the exact `lm_head`.
+
 Effective traffic at 368 tok/s is `368 × 0.417 ≈ 153` GB/s — **61% of the 250 GB/s
 this host actually delivers**, against M4's ~65% of its own peak. Exact-head
-efficiency is now roughly M4-class; what is left is the last few percent.
+efficiency is now roughly M4-class. FlashHead is the 169→218 jump (29% on M4,
+~32% here).
 
 ### 273 GB/s is not reachable — calibrate against 250
 
@@ -340,7 +363,7 @@ The honest tools, in order of trust: full sampled decode timed several times
 (`tests/test_bench.py --bench`), ablation against full decode, round-robin A/B
 of launch configs, L2-cold microbench, and last a plain microbench.
 
-### Open issues (next session: more exact-head speed, not FlashHead)
+### Open issues (next session: optional HTTP, or more body-kernel speed)
 
 1. **QKV/O is the weakest kernel**, ~55% of achievable against ~85% for the
    lm_head and the expert SwiGLU. It is the only body GEMV with a fused input
@@ -348,10 +371,9 @@ of launch configs, L2-cold microbench, and last a plain microbench.
    out of the dot product, so sumsq accumulates inside the main loop), but the
    O projection with no norm at all still runs materially better, so there may
    be more here. Do not unpack ternary codes to get it.
-2. **The lm_head is ~30% of the token** at ~213 GB/s (85% of achievable). Its
-   traffic is already minimal for an exact head: 4-bit codes plus bf16
-   scales/biases. Getting past this probably means FlashHead (phase 4), which
-   is the sanctioned next step *only when the user asks*.
+2. **FlashHead is done** (phase 4). Exact-head `lm_head` remains ~30% of the
+   token when `--flash-head` is off. Indexed probe GEMV must keep the same
+   BLOCK_N=16 tiles as `rtn4_gemv`; a one-CTA-per-cluster launch was a wash.
 3. **The fused sampler is the only thing left outside the CUDA graph** (~37
    us/token, three eager launches including the `torch.rand` for the uniform).
    A self-feeding graph that samples and writes its own next `token_ids` would
@@ -362,15 +384,19 @@ of launch configs, L2-cold microbench, and last a plain microbench.
    less than it looks.
 5. **Greedy think-trace loops.** Greedy haiku `--max-tokens 700` still hits the
    cap recounting syllables. France T=0 remains the greedy correctness check
-   (must print Paris). **Measure tok/s with sampled decode**, never greedy.
+   (must print Paris, with or without `--flash-head`). **Measure tok/s with
+   sampled decode**, never greedy.
 6. CUDA graphs are on when 8-token replay matches eager sampled ids. Do not
    skip the match check. Capture warmup must restore KV `seqlen` and the
-   default CUDA RNG (CLI `--seed` unset uses that generator).
+   default CUDA RNG (CLI `--seed` unset uses that generator). FlashHead is
+   inside the captured forward (seq_len==1 only).
 
-### Phase 4 — FlashHead (optional)
+### Phase 4 — FlashHead — **done**
 
-Port `generate_flash_head`. This is the 169→218 tok/s jump on M4, not the reason
-the model is ternary. **Do not start until asked.**
+Port of `generate_flash_head` / `FlashHead`. 4748 equal-size clusters, probe
+top 512, always score force tokens. Attach with
+`maple-run convert checkpoints/maple-2bit --flash-head-only` (already run).
+Enable at decode with `--flash-head`. Default generate stays exact-head.
 
 ### Phase 5 — HTTP (optional)
 
@@ -389,11 +415,13 @@ Only after packed decode works. Do not start here.
 | `src/maple_run/kernels/router.py` | Fused router GEMV + softmax + top-k + renorm |
 | `src/maple_run/kernels/sampler.py` | Fused top-k / temperature / nucleus sampling |
 | `src/maple_run/kernels/decode_attn.py` | q_len=1 QK-RMS/RoPE + GQA (loops seqlen/SWA) |
-| `src/maple_run/kernels/rtn4.py` | 4-bit RTN embedding + lm_head GEMV |
+| `src/maple_run/kernels/rtn4.py` | 4-bit RTN embedding + lm_head GEMV + indexed FlashHead GEMV |
+| `src/maple_run/flash_head.py` | Cluster attach (`generate_flash_head`) + decode FlashHead |
 | `src/maple_run/linear.py` | PackedTernaryLinear / Experts / RTN4 |
 | `src/maple_run/model.py` | MapleForCausalLM packed forward |
 | `src/maple_run/generate.py` | Tokenizer + greedy/sampled decode + tok/s |
-| `tests/test_bench.py` | Sampled decode speed (`pytest --bench`) |
+| `tests/test_bench.py` | Sampled decode speed (`pytest --bench`); FlashHead when attached |
+| `tests/test_flash_head.py` | Clustering, exact-when-all-probes, prefill stays exact |
 | `docs/sources/mlx_lm_ternary.py` | **Authoritative packer** (DeepGrove, MIT) |
 | `docs/sources/mlx_lm_deepgrove_README.md` | MLX runtime README |
 | `docs/sources/maple-preview-config.json` | HF `config.json` copy |

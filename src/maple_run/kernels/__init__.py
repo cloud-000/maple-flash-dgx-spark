@@ -8,6 +8,7 @@ __all__ = [
     "ternary_expert_swiglu",
     "ternary_expert_down_sum",
     "rtn4_gemv",
+    "rtn4_indexed_gemv",
     "rtn4_embedding",
     "rms_norm",
     "add_rms_norm",
@@ -27,7 +28,7 @@ def __getattr__(name: str):
         from maple_run.kernels import ternary_expert as _exp
 
         return getattr(_exp, name)
-    if name in {"rtn4_gemv", "rtn4_embedding"}:
+    if name in {"rtn4_gemv", "rtn4_indexed_gemv", "rtn4_embedding"}:
         from maple_run.kernels import rtn4 as _rtn4
 
         return getattr(_rtn4, name)

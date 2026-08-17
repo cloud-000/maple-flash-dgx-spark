@@ -289,6 +289,7 @@ def generate(
     top_p: float = DEFAULT_TOP_P,
     top_k: int = DEFAULT_TOP_K,
     seed: int | None = None,
+    flash_head: bool = False,
 ) -> GenerateResult:
     """Load a packed checkpoint, decode, print text and tok/s."""
     from transformers import AutoTokenizer
@@ -297,7 +298,7 @@ def generate(
 
     model_dir = str(Path(model_dir).expanduser())
     print(f"Loading packed model from {model_dir}", flush=True)
-    model = MapleForCausalLM.from_packed(model_dir)
+    model = MapleForCausalLM.from_packed(model_dir, use_flash_head=flash_head)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="You are using a model of type")
         tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
@@ -324,6 +325,13 @@ def generate(
         f"(handoff ~{traffic['unpacked_handoff_bytes'] / 1e9:.1f} GB/token)",
         flush=True,
     )
+    if flash_head:
+        meta = model.config.get("flash_head") or {}
+        print(
+            f"FlashHead: {meta.get('n_clusters')} clusters, "
+            f"{meta.get('n_probes')} probes, force={meta.get('force_tokens')}",
+            flush=True,
+        )
 
     with torch.inference_mode():
         # JIT decode kernels (q_len=1 path) before the timed run.
@@ -332,6 +340,13 @@ def generate(
             cache=model.make_cache(max_len=8),
             logits_to_keep=1,
         )
+        if flash_head:
+            # Prefill still uses the exact lm_head (seq_len != 1).
+            model.forward(
+                torch.zeros(1, 2, dtype=torch.long, device=model.device),
+                cache=model.make_cache(max_len=8),
+                logits_to_keep=1,
+            )
         torch.cuda.synchronize()
 
     greedy = is_greedy(temperature, top_k)

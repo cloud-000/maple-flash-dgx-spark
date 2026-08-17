@@ -26,10 +26,11 @@ hardware numbers. Vendored algorithm source is `docs/sources/mlx_lm_ternary.py`.
    (700-tok haiku); greedy France (`--temperature 0`) is correctness only.
    That is past the M4-scaled target computed against the bandwidth this host
    actually delivers (~250 GB/s, not the 273 GB/s spec) and ~5% short of the
-   386 tok/s computed from the spec sheet. **Start here** (more kernel
-   efficiency) — and read "How to measure on this host" in the handoff first,
-   because naive kernel microbenchmarks on this box are off by 2-3x.
-4. **FlashHead** (`maple_run/generate.py` / head clustering): not until asked.
+   386 tok/s computed from the spec sheet. Default generate path — do not
+   regress it.
+4. **FlashHead** (`maple_run/flash_head.py`): **done.** `--flash-head` scores
+   4748 centroids then exact logits for 512 clusters (~487 tok/s). Clusters
+   are attached on `checkpoints/maple-2bit`. Prefill stays exact.
 
 Stop at the phase the user asked for. Do not skip packing tests to jump to a
 server.
