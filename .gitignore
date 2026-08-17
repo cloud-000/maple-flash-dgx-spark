@@ -12,6 +12,7 @@ wheels/
 # Local checkpoints and conversion output
 checkpoints/
 data/
+evals/
 *.safetensors
 !docs/sources/**
 

@@ -79,3 +79,19 @@ FlashHead: n_clusters=4748, n_probes=512, vocab=151936
 
 Packing: 16×2-bit codes per uint32, LSB first, codes = `{−1,0,+1} + 1`.
 Ternarize arithmetic in **float32**; only final `alpha` returns to weight dtype.
+
+## Quality benches (DeepGrove Maple-Preview table)
+
+DeepGrove reported dense-head scores on LCBv6 / AIME 2026 / HMMT 2026 / GPQA-D
+(78.7% mean). They did not publish a harness. `maple-run eval` uses:
+
+- MathArena AIME 2026: https://huggingface.co/datasets/MathArena/aime_2026
+  config https://github.com/eth-sri/matharena/blob/main/configs/competitions/aime/aime_2026.yaml
+- MathArena HMMT Feb 2026: https://huggingface.co/datasets/MathArena/hmmt_feb_2026
+- GPQA Diamond CSV (OpenAI simple-evals copy):
+  https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv
+  prompt: https://github.com/openai/simple-evals/blob/main/gpqa_eval.py
+- LiveCodeBench v6 (175 problems): https://huggingface.co/datasets/livecodebench/code_generation_lite
+  prompts/tests: https://github.com/LiveCodeBench/LiveCodeBench
+- Launch page (JS app; table is also on the HF model card image):
+  https://deepgrove.ai/maple-preview

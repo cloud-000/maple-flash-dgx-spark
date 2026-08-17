@@ -116,6 +116,69 @@ def main(argv: list[str] | None = None) -> int:
     generate.add_argument("--prompt", required=True)
     _add_sampling_args(generate)
 
+    eval_p = sub.add_parser(
+        "eval",
+        help="Reproduce DeepGrove quality benches (AIME / HMMT / GPQA / LCB)",
+    )
+    eval_p.add_argument("--model", required=True, help="Packed checkpoint directory")
+    eval_p.add_argument(
+        "--bench",
+        default="all",
+        help="Comma-separated: aime2026,hmmt2026,gpqa,lcbv6 or all (default all)",
+    )
+    eval_p.add_argument(
+        "--output",
+        default="evals",
+        help="Directory for JSONL results + summaries (default evals)",
+    )
+    eval_p.add_argument(
+        "--n-samples",
+        type=int,
+        default=4,
+        help="Completions per problem (default 4; MathArena / simple-evals)",
+    )
+    eval_p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Only the first N problems of each bench (smoke tests)",
+    )
+    eval_p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=64000,
+        help="Max new tokens per sample (default 64000, MathArena cap)",
+    )
+    eval_p.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Softmax temperature (default 1.0). 0 is greedy argmax",
+    )
+    eval_p.add_argument(
+        "--top-p",
+        type=float,
+        default=0.95,
+        help="Nucleus sampling cutoff after top-k (default 0.95)",
+    )
+    eval_p.add_argument(
+        "--top-k",
+        type=int,
+        default=20,
+        help="Keep the top-k softmax tokens before nucleus (default 20)",
+    )
+    eval_p.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Base CUDA seed; sample i of problem p uses seed+p*n+i (default 0)",
+    )
+    eval_p.add_argument(
+        "--flash-head",
+        action="store_true",
+        help="Approximate lm_head (DeepGrove reported the dense head)",
+    )
+
     serve = sub.add_parser(
         "serve",
         help="OpenAI-compatible HTTP server for a packed checkpoint",
@@ -178,6 +241,32 @@ def main(argv: list[str] | None = None) -> int:
             top_k=args.top_k,
             seed=args.seed,
             flash_head=args.flash_head,
+        )
+        return 0
+    if args.cmd == "eval":
+        _validate_sampling_args(parser, args)
+        if args.n_samples < 1:
+            parser.error("--n-samples must be >= 1")
+        if args.limit is not None and args.limit < 0:
+            parser.error("--limit must be >= 0")
+        from maple_run.eval import parse_benches, run_eval
+
+        try:
+            benches = parse_benches(args.bench)
+        except ValueError as exc:
+            parser.error(str(exc))
+        run_eval(
+            args.model,
+            benches,
+            output_dir=args.output,
+            n_samples=args.n_samples,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            seed=args.seed,
+            flash_head=args.flash_head,
+            limit=args.limit,
         )
         return 0
     if args.cmd == "serve":

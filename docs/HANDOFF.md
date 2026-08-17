@@ -8,8 +8,9 @@ Transformers path is slow, and what a packed-kernel runtime has to do.
 (`--flash-head`) is ~487 tok/s on the 256-tok bench / ~489 tok/s on 700-tok
 haiku — the M4-class 169→218 jump, on this host. Default generate is still
 exact-head; do not regress it. `maple-run serve` is an OpenAI-compatible HTTP
-endpoint. Do not re-convert unless the packed checkpoint is missing; FlashHead
-clusters are already attached (`--flash-head-only`).
+endpoint. `maple-run eval` reproduces DeepGrove's quality table on packed
+kernels (dense head). Do not re-convert unless the packed checkpoint is
+missing; FlashHead clusters are already attached (`--flash-head-only`).
 Do not start with a web search for Maple, MLX, or Spark bandwidth; read
 `docs/SOURCES.md` and `AGENTS.md` first — and read "How to measure on this host"
 below before trusting any kernel benchmark.
@@ -23,6 +24,7 @@ below before trusting any kernel benchmark.
 | 3 Model decode | **Done, fused, and tuned twice.** Packed forward + fused RMS/QKV/SwiGLU/decode attn + fused router + fused sampler. Exact-head sampled **~368 tok/s** on the 256-tok bench, **~364 tok/s** on 700-tok haiku. CUDA graphs used when replay matches eager sampled ids. **Default generate path; do not regress.** |
 | 4 FlashHead | **Done.** `maple_run/flash_head.py` + indexed 4-bit GEMV. 4748 clusters / 512 probes attached on this host. Sampled **~487 tok/s** (256-tok bench) / **~489 tok/s** (700-tok haiku). Prefill stays on the exact head. CLI: `--flash-head`. Tests in `tests/test_flash_head.py`. |
 | 5 HTTP | **Done.** `maple-run serve` OpenAI `/v1/chat/completions` + `/v1/completions`. |
+| 6 Quality evals | **Harness done.** `maple-run eval` — AIME 2026, HMMT Feb 2026, GPQA-D, LCBv6 on the dense head. Full numbers still running. |
 
 Packed checkpoint on this host (gitignored, do not commit):
 
@@ -415,11 +417,25 @@ Endpoints: `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`
 One CUDA generate at a time. Prefill stays on the exact head. Do not regress
 the CLI generate path.
 
+### Phase 6 — quality evals — **harness done, numbers in progress**
+
+`maple-run eval` runs DeepGrove's published table on packed kernels + the
+**dense** 4-bit head (not FlashHead): LiveCodeBench v6, AIME 2026, HMMT Feb
+2026, GPQA-Diamond. Protocol: T=1.0 top_p=0.95 top_k=20, n=4, max_tokens=64000,
+MathArena boxed grading, simple-evals GPQA shuffle, official LCB tests.
+Resume under `--output` (gitignored `evals/`). DeepGrove's numbers: LCB 75.1,
+AIME 87.5, HMMT 78.8, GPQA-D 73.5 (mean 78.7).
+
+```bash
+uv sync --extra cuda --extra tokenizer --extra eval
+uv run maple-run eval --model checkpoints/maple-2bit --output evals/maple-2bit
+```
+
 ## Scaffold map
 
 | Path | Role |
 |---|---|
-| `src/maple_run/cli.py` | `convert` / `generate` / `serve` subcommands |
+| `src/maple_run/cli.py` | `convert` / `generate` / `serve` / `eval` subcommands |
 | `src/maple_run/server.py` | OpenAI-compatible HTTP (`/v1/chat/completions`) |
 | `src/maple_run/pack.py` | CPU ternarize + pack_2bit + 4-bit RTN |
 | `src/maple_run/convert.py` | Streaming HF → packed safetensors |
@@ -434,6 +450,10 @@ the CLI generate path.
 | `src/maple_run/linear.py` | PackedTernaryLinear / Experts / RTN4 |
 | `src/maple_run/model.py` | MapleForCausalLM packed forward |
 | `src/maple_run/generate.py` | Tokenizer + greedy/sampled decode + tok/s |
+| `src/maple_run/eval.py` | Quality-eval runner (AIME / HMMT / GPQA / LCB) |
+| `src/maple_run/eval_score.py` | Boxed / letter / code extraction and grading |
+| `src/maple_run/eval_lcb.py` | LiveCodeBench v6 load + isolated code tests |
+| `tests/test_eval.py` | Extractors, LCB grader, CLI `eval`, resume |
 | `tests/test_bench.py` | Sampled decode speed (`pytest --bench`); FlashHead when attached |
 | `tests/test_flash_head.py` | Clustering, exact-when-all-probes, prefill stays exact |
 | `tests/test_server.py` | OpenAI request parsing, CLI `serve` flags, fake-engine HTTP |
@@ -447,7 +467,7 @@ the CLI generate path.
 `numpy`). CUDA extra is pinned to this host's stack: `torch==2.13.0` /
 `triton==3.7.1` (PyPI manylinux aarch64 CUDA 13.0, same as `2.13.0+cu130`).
 Tokenizer extra is `transformers>=4.57.0` (model card `transformers_version`
-4.57.1).
+4.57.1). Eval extra is `datasets` + `sympy` for `maple-run eval`.
 
 ## Out of scope unless the user asks
 
