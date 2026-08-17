@@ -22,6 +22,7 @@ from maple_run.generate import (
 from maple_run.server import (
     RequestError,
     ServerDefaults,
+    apply_system_prompt,
     chat_completion_response,
     make_handler,
     parse_chat_messages,
@@ -123,6 +124,18 @@ def test_parse_tools():
         parse_tools({"tools": {"name": "x"}})
 
 
+def test_apply_system_prompt_prepends_when_missing():
+    messages = [{"role": "user", "content": "hi"}]
+    out = apply_system_prompt({"system": "You are Bob"}, messages)
+    assert out[0] == {"role": "system", "content": "You are Bob"}
+    assert out[1]["role"] == "user"
+    kept = apply_system_prompt(
+        {"system": "ignored"},
+        [{"role": "developer", "content": "already here"}, {"role": "user", "content": "hi"}],
+    )
+    assert kept[0]["content"] == "already here"
+
+
 def test_openai_response_shape():
     result = GenerateResult(
         text="Paris",
@@ -168,6 +181,31 @@ def test_openai_response_includes_reasoning():
     assert message["reasoning_content"] == "the capital of France"
 
 
+def test_openai_response_includes_tool_calls():
+    result = GenerateResult(
+        text="",
+        prompt_len=10,
+        n_new=8,
+        prefill_s=0.1,
+        decode_s=0.2,
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read", "arguments": "{\"path\": \"x\"}"},
+            }
+        ],
+    )
+    chat = chat_completion_response(
+        result, model="maple-2bit", created=1, req_id="chatcmpl-x"
+    )
+    message = chat["choices"][0]["message"]
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "read"
+    assert chat["choices"][0]["finish_reason"] == "tool_calls"
+
+
 def test_cli_serve_help(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["serve", "--help"])
@@ -201,7 +239,17 @@ class FakeEngine:
     last_tools: object | None = None
     last_messages: object | None = None
 
-    def chat(self, messages, sampling, on_text=None, on_reasoning=None, tools=None):
+    tool_calls: list = field(default_factory=list)
+
+    def chat(
+        self,
+        messages,
+        sampling,
+        on_text=None,
+        on_reasoning=None,
+        on_tool_calls=None,
+        tools=None,
+    ):
         self.last_sampling = sampling
         self.last_tools = tools
         self.last_messages = messages
@@ -209,6 +257,8 @@ class FakeEngine:
             on_reasoning(self.reasoning)
         if on_text is not None:
             on_text(self.text)
+        if on_tool_calls is not None and self.tool_calls:
+            on_tool_calls(self.tool_calls)
         return GenerateResult(
             text=self.text,
             prompt_len=5,
@@ -216,8 +266,9 @@ class FakeEngine:
             prefill_s=0.01,
             decode_s=0.02,
             token_ids=[1, 2, 3],
-            finish_reason="stop",
+            finish_reason="tool_calls" if self.tool_calls else "stop",
             reasoning=self.reasoning,
+            tool_calls=self.tool_calls,
         )
 
     def complete(self, prompt, sampling, on_text=None):
@@ -438,3 +489,48 @@ def test_http_chat_stream_reasoning():
         assert '"reasoning": "capital city"' in payload
         assert '"reasoning_content": "capital city"' in payload
         assert '"content": "Paris"' in payload
+
+
+def test_http_chat_emits_openai_tool_calls():
+    engine = FakeEngine(
+        text="",
+        tool_calls=[
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read", "arguments": "{\"path\": \"x\"}"},
+            }
+        ],
+    )
+    with _server(engine) as port:
+        status, body, _ = _post(
+            port,
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "read x"}]},
+        )
+        assert status == 200
+        message = body["choices"][0]["message"]
+        assert message["tool_calls"][0]["function"]["name"] == "read"
+        assert body["choices"][0]["finish_reason"] == "tool_calls"
+
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        raw = json.dumps(
+            {
+                "messages": [{"role": "user", "content": "read x"}],
+                "stream": True,
+            }
+        ).encode()
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=raw,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(raw)),
+            },
+        )
+        payload = conn.getresponse().read().decode()
+        conn.close()
+        assert '"tool_calls"' in payload
+        assert '"name": "read"' in payload
+        assert '"index": 0' in payload

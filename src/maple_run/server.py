@@ -22,6 +22,7 @@ from maple_run.generate import (
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
     GenerateResult,
+    describe_chat_prompt,
     encode_messages,
     encode_prompt,
     load_packed,
@@ -148,6 +149,16 @@ def parse_tools(body: dict) -> list | None:
     return tools
 
 
+def apply_system_prompt(body: dict, messages: list[dict]) -> list[dict]:
+    """Honor a top-level ``system`` field if no system/developer message exists."""
+    system = body.get("system")
+    if not isinstance(system, str) or not system:
+        return messages
+    if any(str(m.get("role")) in ("system", "developer") for m in messages):
+        return messages
+    return [{"role": "system", "content": system}, *messages]
+
+
 def parse_completion_prompt(body: dict) -> str:
     prompt = body.get("prompt")
     if prompt is None:
@@ -172,10 +183,12 @@ def usage_dict(result: GenerateResult) -> dict[str, int]:
 def chat_completion_response(
     result: GenerateResult, *, model: str, created: int, req_id: str
 ) -> dict:
-    message: dict[str, Any] = {"role": "assistant", "content": result.text}
+    message: dict[str, Any] = {"role": "assistant", "content": result.text or None}
     if result.reasoning:
         message["reasoning"] = result.reasoning
         message["reasoning_content"] = result.reasoning
+    if result.tool_calls:
+        message["tool_calls"] = result.tool_calls
     return {
         "id": req_id,
         "object": "chat.completion",
@@ -218,11 +231,12 @@ def chat_chunk(
     model: str,
     content: str | None = None,
     reasoning: str | None = None,
+    tool_calls: list[dict] | None = None,
     role: str | None = None,
     finish_reason: str | None = None,
     usage: dict[str, int] | None = None,
 ) -> dict:
-    delta: dict[str, str] = {}
+    delta: dict[str, Any] = {}
     if role is not None:
         delta["role"] = role
     if content is not None:
@@ -230,6 +244,8 @@ def chat_chunk(
     if reasoning is not None:
         delta["reasoning"] = reasoning
         delta["reasoning_content"] = reasoning
+    if tool_calls:
+        delta["tool_calls"] = tool_calls
     chunk: dict[str, Any] = {
         "id": req_id,
         "object": "chat.completion.chunk",
@@ -294,12 +310,14 @@ class PackedEngine:
         sampling: Sampling,
         on_text: Callable[[str], None] | None = None,
         on_reasoning: Callable[[str], None] | None = None,
+        on_tool_calls: Callable[[list[dict]], None] | None = None,
         tools: list | None = None,
     ) -> GenerateResult:
         input_ids = encode_messages(
             self.tokenizer, messages, self.model.device, tools=tools
         )
-        return self._generate(input_ids, sampling, on_text, on_reasoning)
+        print(describe_chat_prompt(self.tokenizer, input_ids, tools), flush=True)
+        return self._generate(input_ids, sampling, on_text, on_reasoning, on_tool_calls)
 
     def complete(
         self,
@@ -310,7 +328,9 @@ class PackedEngine:
         input_ids = encode_prompt(self.tokenizer, prompt, self.model.device)
         return self._generate(input_ids, sampling, on_text)
 
-    def _generate(self, input_ids, sampling: Sampling, on_text, on_reasoning=None) -> GenerateResult:
+    def _generate(
+        self, input_ids, sampling: Sampling, on_text, on_reasoning=None, on_tool_calls=None
+    ) -> GenerateResult:
         with self._lock:
             if not self._warmed:
                 warmup_model(self.model, flash_head=self.defaults.flash_head)
@@ -326,6 +346,7 @@ class PackedEngine:
                 seed=sampling.seed,
                 on_text=on_text,
                 on_reasoning=on_reasoning,
+                on_tool_calls=on_tool_calls,
             )
 
 
@@ -399,7 +420,7 @@ def make_handler(engine: PackedEngine):
             return body
 
         def _chat(self, body: dict) -> None:
-            messages = parse_chat_messages(body)
+            messages = apply_system_prompt(body, parse_chat_messages(body))
             sampling = parse_sampling(body, engine.defaults)
             tools = parse_tools(body)
             created = int(time.time())
@@ -483,8 +504,32 @@ def make_handler(engine: PackedEngine):
                         )
                     )
 
+                tool_index = 0
+
+                def on_tool_calls(calls: list[dict]) -> None:
+                    nonlocal tool_index
+                    indexed = []
+                    for call in calls:
+                        item = dict(call)
+                        item["index"] = tool_index
+                        tool_index += 1
+                        indexed.append(item)
+                    self._write_sse(
+                        chat_chunk(
+                            req_id=req_id,
+                            created=created,
+                            model=sampling.model,
+                            tool_calls=indexed,
+                        )
+                    )
+
                 result = engine.chat(
-                    messages, sampling, on_text=on_text, on_reasoning=on_reasoning, tools=tools
+                    messages,
+                    sampling,
+                    on_text=on_text,
+                    on_reasoning=on_reasoning,
+                    on_tool_calls=on_tool_calls,
+                    tools=tools,
                 )
                 self._write_sse(
                     chat_chunk(

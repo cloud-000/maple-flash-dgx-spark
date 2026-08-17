@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import torch
 
+import json
+from pathlib import Path
+
+import pytest
+
 from maple_run.generate import (
     CompletionDecoder,
     decode_holding_incomplete,
     encode_messages,
+    parse_tool_call_json,
     prompt_in_think,
+    split_content_and_tools,
 )
+
+PACKED = Path(__file__).resolve().parents[1] / "checkpoints" / "maple-2bit"
 
 
 class _CapturingTokenizer:
@@ -72,6 +81,20 @@ def test_encode_messages_omits_empty_tools():
     assert "tools" not in tok.captured_kwargs
 
 
+def test_encode_messages_maps_developer_to_system():
+    tok = _CapturingTokenizer()
+    encode_messages(
+        tok,
+        [
+            {"role": "developer", "content": "You are Bob, a happy builder on mars"},
+            {"role": "user", "content": "who are you?"},
+        ],
+        "cpu",
+    )
+    assert tok.captured_messages[0]["role"] == "system"
+    assert "Bob" in tok.captured_messages[0]["content"]
+
+
 def test_prompt_in_think_detects_open_tag():
     tok = _SeqTokenizer()
     open_ids = torch.tensor([[5, 1, 10]])
@@ -99,3 +122,70 @@ def test_decoder_holds_incomplete_utf8():
     assert dec.push(11) == ("", "é")
     assert decode_holding_incomplete(tok, [10]) == ""
     assert decode_holding_incomplete(tok, [10, 11]) == "é"
+
+
+def test_split_content_and_tools():
+    text = 'hi\n<tool_call>\n{"name": "read", "arguments": {"path": "x"}}\n</tool_call>\n'
+    visible, calls, in_tool = split_content_and_tools(text)
+    assert visible == "hi"
+    assert not in_tool
+    assert calls[0]["function"]["name"] == "read"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"path": "x"}
+    open_text = text + "<tool_call>\n{"
+    visible, calls, in_tool = split_content_and_tools(open_text)
+    assert in_tool
+    assert visible == "hi"
+
+
+def test_parse_tool_call_json_rejects_garbage():
+    assert parse_tool_call_json("not json") is None
+    assert parse_tool_call_json('{"arguments": {}}') is None
+
+
+def test_decoder_extracts_tool_call_and_hides_xml():
+    tok = _SeqTokenizer()
+    dec = CompletionDecoder(tok, in_think=False, skip_ids=set())
+    xml = '<tool_call>\n{"name": "read", "arguments": {"path": "x"}}\n</tool_call>'
+    for ch in xml:
+        dec.push(12 if ch == "\n" else ord(ch))
+    assert dec.finalize()[1] == ""
+    assert dec.tool_calls[0]["function"]["name"] == "read"
+    assert dec.take_new_tool_calls()[0]["type"] == "function"
+
+
+@pytest.mark.skipif(
+    not (PACKED / "tokenizer.json").exists(), reason="packed tokenizer not on disk"
+)
+def test_maple_template_keeps_system_skills_and_tools():
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(PACKED, trust_remote_code=True)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            },
+        }
+    ]
+    ids = encode_messages(
+        tok,
+        [
+            {
+                "role": "developer",
+                "content": "You are Bob, a happy builder who lives on mars.\n\n# Skills\n- Cloudflare Workers",
+            },
+            {"role": "user", "content": "who are you?"},
+        ],
+        "cpu",
+        tools=tools,
+    )
+    text = tok.decode(ids[0].tolist(), skip_special_tokens=False)
+    assert "You are Bob" in text
+    assert "mars" in text
+    assert "Cloudflare Workers" in text
+    assert "# Tools" in text
+    assert "read" in text
+    assert "<think>" in text

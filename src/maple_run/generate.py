@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import re
 import time
+import uuid
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -39,6 +42,7 @@ class GenerateResult:
     token_ids: list[int] = field(default_factory=list)
     finish_reason: str = "stop"
     reasoning: str = ""
+    tool_calls: list[dict] = field(default_factory=list)
 
     @property
     def decode_tok_s(self) -> float:
@@ -336,6 +340,11 @@ def message_text(content) -> str:
 _REPLACEMENT = "\ufffd"
 _THINK_START = "<think>"
 _THINK_END = "</think>"
+_TOOL_START = "<tool_call>"
+_TOOL_END = "</tool_call>"
+_TOOL_RE = re.compile(
+    r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL
+)
 
 
 def _as_token_id_set(value) -> set[int]:
@@ -401,6 +410,40 @@ def decode_holding_incomplete(tokenizer, token_ids: list[int]) -> str:
     return text
 
 
+def parse_tool_call_json(body: str) -> dict | None:
+    """Parse Maple ``<tool_call>`` JSON into an OpenAI tool_calls item."""
+    try:
+        obj = json.loads(body.strip())
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict) or not obj.get("name"):
+        return None
+    args = obj.get("arguments", {})
+    if not isinstance(args, str):
+        args = json.dumps(args, ensure_ascii=False)
+    return {
+        "id": f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {"name": str(obj["name"]), "arguments": args},
+    }
+
+
+def split_content_and_tools(text: str) -> tuple[str, list[dict], bool]:
+    """Strip ``<tool_call>`` blocks from visible text. ``in_tool`` if one is open."""
+    calls: list[dict] = []
+    for match in _TOOL_RE.finditer(text):
+        parsed = parse_tool_call_json(match.group(1))
+        if parsed is not None:
+            calls.append(parsed)
+    last_start = text.rfind(_TOOL_START)
+    last_end = text.rfind(_TOOL_END)
+    in_tool = last_start >= 0 and last_start > last_end
+    cut = last_start if in_tool else None
+    visible = text if cut is None else text[:cut]
+    visible = _TOOL_RE.sub("", visible)
+    return visible.strip("\n"), calls, in_tool
+
+
 class CompletionDecoder:
     """Split Maple ``<think>`` traces and hold incomplete UTF-8 across tokens.
 
@@ -425,11 +468,22 @@ class CompletionDecoder:
         self._content_ids: list[int] = []
         self._think_text = ""
         self._content_text = ""
+        self.tool_calls: list[dict] = []
+        self._emitted_tools = 0
+        self.should_stop = False
+
+    def take_new_tool_calls(self) -> list[dict]:
+        new = self.tool_calls[self._emitted_tools :]
+        self._emitted_tools = len(self.tool_calls)
+        return new
 
     def push(self, token_id: int) -> tuple[str, str]:
         """Feed one token. Returns ``(reasoning_delta, content_delta)``."""
         tid = int(token_id)
         if self.think_start is not None and tid == self.think_start:
+            if self.tool_calls:
+                self.should_stop = True
+                return "", ""
             self.state = "think"
             return "", ""
         if self.think_end is not None and tid == self.think_end:
@@ -444,9 +498,13 @@ class CompletionDecoder:
             self._think_text = text
             return delta, ""
         self._content_ids.append(tid)
-        text = decode_holding_incomplete(self.tokenizer, self._content_ids).lstrip("\n")
-        delta = text[len(self._content_text) :]
-        self._content_text = text
+        raw = decode_holding_incomplete(self.tokenizer, self._content_ids)
+        visible, calls, in_tool = split_content_and_tools(raw)
+        if self.tool_calls and not in_tool and visible[len(self._content_text) :].strip():
+            self.should_stop = True
+        self.tool_calls = calls
+        delta = visible[len(self._content_text) :]
+        self._content_text = visible
         return "", delta
 
     def finalize(self) -> tuple[str, str]:
@@ -454,9 +512,16 @@ class CompletionDecoder:
 
 
 def _chat_message(message: dict) -> dict:
-    """Keep tool_calls / reasoning / names; flatten multimodal content to text."""
+    """Keep tool_calls / reasoning / names; flatten multimodal content to text.
+
+    Pi sends the system prompt as ``developer`` when the model is marked
+    reasoning + ``supportsDeveloperRole``. Maple's jinja only reads ``system``.
+    """
     out = dict(message)
-    out["role"] = str(message["role"])
+    role = str(message["role"])
+    if role == "developer":
+        role = "system"
+    out["role"] = role
     out["content"] = message_text(message.get("content"))
     return out
 
@@ -488,6 +553,17 @@ def encode_messages(
         tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt"),
         device,
     )
+
+
+def describe_chat_prompt(tokenizer, input_ids: torch.Tensor, tools: list | None) -> str:
+    """One-line serve log: whether system/skills made it into the tokenized prompt."""
+    ids = input_ids.reshape(-1)
+    n = int(ids.numel())
+    head = tokenizer.decode(ids[: min(n, 96)].tolist(), skip_special_tokens=False)
+    head = " ".join(head.split())
+    if len(head) > 160:
+        head = head[:160] + "…"
+    return f"Chat prompt {n} tok tools={len(tools or [])} head={head!r}"
 
 
 def encode_prompt(tokenizer, prompt: str, device) -> torch.Tensor:
@@ -553,6 +629,7 @@ def run_generate(
     on_token: Callable[[int], None] | None = None,
     on_text: Callable[[str], None] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
+    on_tool_calls: Callable[[list[dict]], None] | None = None,
 ) -> GenerateResult:
     """Decode from ``input_ids`` on an already-loaded packed model."""
     def emit(msg: str) -> None:
@@ -651,8 +728,13 @@ def run_generate(
                 on_reasoning(r_delta)
             if c_delta and on_text is not None:
                 on_text(c_delta)
+            new_calls = decoder.take_new_tool_calls()
+            if new_calls and on_tool_calls is not None:
+                on_tool_calls(new_calls)
             if stop_ids and next_id in stop_ids:
                 hit_eos = True
+                break
+            if decoder.should_stop:
                 break
         torch.cuda.synchronize()
         t_end = time.perf_counter()
@@ -672,7 +754,12 @@ def run_generate(
         )
 
     reasoning, text = decoder.finalize()
-    finish_reason = "stop" if hit_eos else "length"
+    if decoder.tool_calls:
+        finish_reason = "tool_calls"
+    elif hit_eos:
+        finish_reason = "stop"
+    else:
+        finish_reason = "length"
     return GenerateResult(
         text=text,
         prompt_len=prompt_len,
@@ -682,6 +769,7 @@ def run_generate(
         token_ids=new_tokens,
         finish_reason=finish_reason,
         reasoning=reasoning,
+        tool_calls=decoder.tool_calls,
     )
 
 
