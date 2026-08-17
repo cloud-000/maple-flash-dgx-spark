@@ -21,14 +21,14 @@ def _gemv_launch_meta(nwords: int, batch: int) -> tuple[int, int, int, int]:
     """BLOCK_N, BLOCK_K_WORDS, warps, stages. Decode (batch=1) needs many CTAs.
 
     K tiles wider than 64 words spill: a ``[BLOCK_N, BLOCK_K_WORDS*16]`` float32
-    ternary tile at 128 words is 64 KB per CTA. Swept L2-cold (rotating over 24
-    weight buffers, as the 24 layers do) this reaches 141 GB/s on QKV and 191
-    GB/s on O; the same sweep against one resident buffer claims far more, which
-    the in-model profile does not deliver.
+    ternary tile at 128 words is 64 KB per CTA. The width was picked by timing
+    full decode, not a microbench: cold-but-isolated the 4- and 8-row tiles look
+    equal, in the model the 4-row tile is worth ~100 us/token (369 -> 384 tok/s)
+    because 768 programs cover DRAM latency where 384 do not.
     """
     if batch == 1:
         if nwords >= 64:
-            return 8, 64, 2, 3
+            return 2, 64, 1, 3
         if nwords >= 32:
             return 16, 32, 4, 4
         return 16, 8, 4, 2
