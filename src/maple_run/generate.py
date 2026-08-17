@@ -38,6 +38,7 @@ class GenerateResult:
     decode_s: float
     token_ids: list[int] = field(default_factory=list)
     finish_reason: str = "stop"
+    reasoning: str = ""
 
     @property
     def decode_tok_s(self) -> float:
@@ -179,7 +180,7 @@ def _decode_n(
     top_p: float,
     top_k: int,
     generator: torch.Generator | None,
-    eos,
+    stop_ids: set[int],
     sampler_ws: tuple[torch.Tensor, ...] | None = None,
 ) -> list[int]:
     ids: list[int] = []
@@ -194,7 +195,7 @@ def _decode_n(
             sampler_ws=sampler_ws,
         )
         ids.append(int(next_t.item()))
-        if eos is not None and ids[-1] == int(eos):
+        if stop_ids and ids[-1] in stop_ids:
             break
         if i + 1 < n:
             logits = replay(next_t)
@@ -249,7 +250,7 @@ def _try_decode_graph(
 
     n_check = _GRAPH_CHECK_TOKENS
     rng_state = _rng_snapshot(model.device, generator)
-    eos = model.eos_token_id
+    stop_ids = stop_token_ids(model)
 
     def eager_replay(next_t: torch.Tensor) -> torch.Tensor:
         return model.forward(next_t.view(1, 1), cache=cache, logits_to_keep=1)
@@ -268,7 +269,7 @@ def _try_decode_graph(
         top_p=top_p,
         top_k=top_k,
         generator=generator,
-        eos=eos,
+        stop_ids=stop_ids,
         sampler_ws=sampler_ws,
     )
     cache.restore(snap)
@@ -283,7 +284,7 @@ def _try_decode_graph(
         top_p=top_p,
         top_k=top_k,
         generator=generator,
-        eos=eos,
+        stop_ids=stop_ids,
         sampler_ws=sampler_ws,
     )
     cache.restore(snap)
@@ -332,23 +333,155 @@ def message_text(content) -> str:
     raise ValueError("message content must be a string or a list of text parts.")
 
 
+_REPLACEMENT = "\ufffd"
+_THINK_START = "<think>"
+_THINK_END = "</think>"
+
+
+def _as_token_id_set(value) -> set[int]:
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        return {int(v) for v in value if v is not None}
+    return {int(value)}
+
+
+def stop_token_ids(model, tokenizer=None) -> set[int]:
+    """Token ids that end a response (``<|im_end|>`` and pad/EOT)."""
+    ids = _as_token_id_set(getattr(model, "eos_token_id", None))
+    if tokenizer is not None:
+        ids |= _as_token_id_set(getattr(tokenizer, "eos_token_id", None))
+        ids |= _as_token_id_set(getattr(tokenizer, "pad_token_id", None))
+    return ids
+
+
+def think_token_ids(tokenizer) -> tuple[int | None, int | None]:
+    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
+    return vocab.get(_THINK_START), vocab.get(_THINK_END)
+
+
+def skip_decode_ids(tokenizer, extra=None) -> set[int]:
+    """Special / control tokens that must not appear in streamed text."""
+    ids = _as_token_id_set(extra)
+    for attr in ("eos_token_id", "bos_token_id", "pad_token_id"):
+        ids |= _as_token_id_set(getattr(tokenizer, attr, None))
+    extra_special = getattr(tokenizer, "additional_special_tokens", None) or []
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if convert is not None:
+        for token in extra_special:
+            tid = convert(token)
+            if isinstance(tid, int) and tid >= 0:
+                ids.add(tid)
+    start, end = think_token_ids(tokenizer)
+    ids |= {tid for tid in (start, end) if tid is not None}
+    return ids
+
+
+def prompt_in_think(tokenizer, input_ids: torch.Tensor) -> bool:
+    """True when the chat template left the prompt inside an open ``<think>``."""
+    start, end = think_token_ids(tokenizer)
+    if start is None:
+        return False
+    last_s = last_e = -1
+    for i, tid in enumerate(input_ids.reshape(-1).tolist()):
+        if tid == start:
+            last_s = i
+        elif end is not None and tid == end:
+            last_e = i
+    return last_s > last_e
+
+
+def decode_holding_incomplete(tokenizer, token_ids: list[int]) -> str:
+    """Decode, but hold a trailing U+FFFD so incomplete UTF-8 is not emitted."""
+    if not token_ids:
+        return ""
+    text = tokenizer.decode(token_ids, skip_special_tokens=False)
+    if text.endswith(_REPLACEMENT):
+        text = text[:-1]
+    return text
+
+
+class CompletionDecoder:
+    """Split Maple ``<think>`` traces and hold incomplete UTF-8 across tokens.
+
+    Maple's chat template always opens ``<think>`` on the generation prompt, so
+    the completion starts mid-thought. mlx-lm puts that span in ``reasoning``
+    and the answer in ``content``; dumping both into ``content`` (and emitting
+    U+FFFD on partial Qwen bytes) is what agent harnesses see as garbage.
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        *,
+        in_think: bool,
+        skip_ids: set[int] | None = None,
+    ):
+        self.tokenizer = tokenizer
+        self.think_start, self.think_end = think_token_ids(tokenizer)
+        self.skip_ids = skip_decode_ids(tokenizer) if skip_ids is None else set(skip_ids)
+        self.state = "think" if in_think else "content"
+        self._think_ids: list[int] = []
+        self._content_ids: list[int] = []
+        self._think_text = ""
+        self._content_text = ""
+
+    def push(self, token_id: int) -> tuple[str, str]:
+        """Feed one token. Returns ``(reasoning_delta, content_delta)``."""
+        tid = int(token_id)
+        if self.think_start is not None and tid == self.think_start:
+            self.state = "think"
+            return "", ""
+        if self.think_end is not None and tid == self.think_end:
+            self.state = "content"
+            return "", ""
+        if tid in self.skip_ids:
+            return "", ""
+        if self.state == "think":
+            self._think_ids.append(tid)
+            text = decode_holding_incomplete(self.tokenizer, self._think_ids)
+            delta = text[len(self._think_text) :]
+            self._think_text = text
+            return delta, ""
+        self._content_ids.append(tid)
+        text = decode_holding_incomplete(self.tokenizer, self._content_ids).lstrip("\n")
+        delta = text[len(self._content_text) :]
+        self._content_text = text
+        return "", delta
+
+    def finalize(self) -> tuple[str, str]:
+        return self._think_text, self._content_text
+
+
+def _chat_message(message: dict) -> dict:
+    """Keep tool_calls / reasoning / names; flatten multimodal content to text."""
+    out = dict(message)
+    out["role"] = str(message["role"])
+    out["content"] = message_text(message.get("content"))
+    return out
+
+
 def _to_input_ids(encoded, device) -> torch.Tensor:
     input_ids = encoded if torch.is_tensor(encoded) else encoded["input_ids"]
     return input_ids.to(device).long()
 
 
-def encode_messages(tokenizer, messages: list[dict], device) -> torch.Tensor:
-    """Apply the chat template, or concatenate roles if the tokenizer has none."""
-    cleaned = [
-        {"role": str(m["role"]), "content": message_text(m.get("content"))}
-        for m in messages
-    ]
+def encode_messages(
+    tokenizer, messages: list[dict], device, *, tools: list | None = None
+) -> torch.Tensor:
+    """Apply the chat template, or concatenate roles if the tokenizer has none.
+
+    Passes ``tools`` and keeps ``tool_calls`` so agent turns match mlx-lm.
+    """
+    cleaned = [_chat_message(m) for m in messages]
     if getattr(tokenizer, "chat_template", None):
-        encoded = tokenizer.apply_chat_template(
-            cleaned,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        )
+        kwargs: dict = {
+            "add_generation_prompt": True,
+            "return_tensors": "pt",
+        }
+        if tools:
+            kwargs["tools"] = tools
+        encoded = tokenizer.apply_chat_template(cleaned, **kwargs)
         return _to_input_ids(encoded, device)
     prompt = "\n".join(f"{m['role']}: {m['content']}" for m in cleaned)
     return _to_input_ids(
@@ -418,6 +551,8 @@ def run_generate(
     seed: int | None = None,
     log: Callable[[str], None] | None = _log_print,
     on_token: Callable[[int], None] | None = None,
+    on_text: Callable[[str], None] | None = None,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> GenerateResult:
     """Decode from ``input_ids`` on an already-loaded packed model."""
     def emit(msg: str) -> None:
@@ -450,6 +585,12 @@ def run_generate(
         )
 
     cache = model.make_cache(max_len=prompt_len + max(max_tokens, 1))
+    stop_ids = stop_token_ids(model, tokenizer)
+    decoder = CompletionDecoder(
+        tokenizer,
+        in_think=prompt_in_think(tokenizer, input_ids),
+        skip_ids=skip_decode_ids(tokenizer, extra=stop_ids),
+    )
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     t_prefill = t0
@@ -477,7 +618,6 @@ def run_generate(
             )
             torch.cuda.synchronize()
         t_decode = time.perf_counter()
-        eos = model.eos_token_id
         pinned = torch.empty((), dtype=torch.long, pin_memory=True)
         eos_ready = torch.cuda.Event()
         for i in range(max_tokens):
@@ -506,7 +646,12 @@ def run_generate(
             new_tokens.append(next_id)
             if on_token is not None:
                 on_token(next_id)
-            if eos is not None and next_id == int(eos):
+            r_delta, c_delta = decoder.push(next_id)
+            if r_delta and on_reasoning is not None:
+                on_reasoning(r_delta)
+            if c_delta and on_text is not None:
+                on_text(c_delta)
+            if stop_ids and next_id in stop_ids:
                 hit_eos = True
                 break
         torch.cuda.synchronize()
@@ -526,7 +671,7 @@ def run_generate(
             f"({n_new / decode_s:.1f} tok/s)"
         )
 
-    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    reasoning, text = decoder.finalize()
     finish_reason = "stop" if hit_eos else "length"
     return GenerateResult(
         text=text,
@@ -536,6 +681,7 @@ def run_generate(
         decode_s=decode_s,
         token_ids=new_tokens,
         finish_reason=finish_reason,
+        reasoning=reasoning,
     )
 
 
@@ -566,5 +712,8 @@ def generate(
         top_k=top_k,
         seed=seed,
     )
-    print(result.text, flush=True)
+    if result.reasoning:
+        print(f"<think>\n{result.reasoning}\n</think>\n\n{result.text}", flush=True)
+    else:
+        print(result.text, flush=True)
     return result

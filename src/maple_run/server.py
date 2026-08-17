@@ -139,6 +139,15 @@ def parse_chat_messages(body: dict) -> list[dict]:
     return out
 
 
+def parse_tools(body: dict) -> list | None:
+    if "tools" not in body or body["tools"] is None:
+        return None
+    tools = body["tools"]
+    if not isinstance(tools, list):
+        raise RequestError("tools must be an array")
+    return tools
+
+
 def parse_completion_prompt(body: dict) -> str:
     prompt = body.get("prompt")
     if prompt is None:
@@ -163,6 +172,10 @@ def usage_dict(result: GenerateResult) -> dict[str, int]:
 def chat_completion_response(
     result: GenerateResult, *, model: str, created: int, req_id: str
 ) -> dict:
+    message: dict[str, Any] = {"role": "assistant", "content": result.text}
+    if result.reasoning:
+        message["reasoning"] = result.reasoning
+        message["reasoning_content"] = result.reasoning
     return {
         "id": req_id,
         "object": "chat.completion",
@@ -171,7 +184,7 @@ def chat_completion_response(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": result.text},
+                "message": message,
                 "finish_reason": result.finish_reason,
             }
         ],
@@ -204,6 +217,7 @@ def chat_chunk(
     created: int,
     model: str,
     content: str | None = None,
+    reasoning: str | None = None,
     role: str | None = None,
     finish_reason: str | None = None,
     usage: dict[str, int] | None = None,
@@ -213,6 +227,9 @@ def chat_chunk(
         delta["role"] = role
     if content is not None:
         delta["content"] = content
+    if reasoning is not None:
+        delta["reasoning"] = reasoning
+        delta["reasoning_content"] = reasoning
     chunk: dict[str, Any] = {
         "id": req_id,
         "object": "chat.completion.chunk",
@@ -276,9 +293,13 @@ class PackedEngine:
         messages: list[dict],
         sampling: Sampling,
         on_text: Callable[[str], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
+        tools: list | None = None,
     ) -> GenerateResult:
-        input_ids = encode_messages(self.tokenizer, messages, self.model.device)
-        return self._generate(input_ids, sampling, on_text)
+        input_ids = encode_messages(
+            self.tokenizer, messages, self.model.device, tools=tools
+        )
+        return self._generate(input_ids, sampling, on_text, on_reasoning)
 
     def complete(
         self,
@@ -289,21 +310,7 @@ class PackedEngine:
         input_ids = encode_prompt(self.tokenizer, prompt, self.model.device)
         return self._generate(input_ids, sampling, on_text)
 
-    def _generate(self, input_ids, sampling: Sampling, on_text) -> GenerateResult:
-        prev = ""
-        acc: list[int] = []
-
-        def on_token(tid: int) -> None:
-            nonlocal prev
-            acc.append(tid)
-            if on_text is None:
-                return
-            text = self.tokenizer.decode(acc, skip_special_tokens=True)
-            delta = text[len(prev) :]
-            prev = text
-            if delta:
-                on_text(delta)
-
+    def _generate(self, input_ids, sampling: Sampling, on_text, on_reasoning=None) -> GenerateResult:
         with self._lock:
             if not self._warmed:
                 warmup_model(self.model, flash_head=self.defaults.flash_head)
@@ -317,7 +324,8 @@ class PackedEngine:
                 top_p=sampling.top_p,
                 top_k=sampling.top_k,
                 seed=sampling.seed,
-                on_token=on_token if on_text is not None else None,
+                on_text=on_text,
+                on_reasoning=on_reasoning,
             )
 
 
@@ -393,12 +401,13 @@ def make_handler(engine: PackedEngine):
         def _chat(self, body: dict) -> None:
             messages = parse_chat_messages(body)
             sampling = parse_sampling(body, engine.defaults)
+            tools = parse_tools(body)
             created = int(time.time())
             req_id = f"chatcmpl-{uuid.uuid4().hex}"
             if sampling.stream:
-                self._stream_chat(messages, sampling, req_id, created)
+                self._stream_chat(messages, sampling, req_id, created, tools=tools)
                 return
-            result = engine.chat(messages, sampling)
+            result = engine.chat(messages, sampling, tools=tools)
             self._json(
                 200,
                 chat_completion_response(
@@ -436,7 +445,12 @@ def make_handler(engine: PackedEngine):
             self.wfile.flush()
 
         def _stream_chat(
-            self, messages: list[dict], sampling: Sampling, req_id: str, created: int
+            self,
+            messages: list[dict],
+            sampling: Sampling,
+            req_id: str,
+            created: int,
+            tools: list | None = None,
         ) -> None:
             self._stream_headers()
             try:
@@ -459,7 +473,19 @@ def make_handler(engine: PackedEngine):
                         )
                     )
 
-                result = engine.chat(messages, sampling, on_text=on_text)
+                def on_reasoning(delta: str) -> None:
+                    self._write_sse(
+                        chat_chunk(
+                            req_id=req_id,
+                            created=created,
+                            model=sampling.model,
+                            reasoning=delta,
+                        )
+                    )
+
+                result = engine.chat(
+                    messages, sampling, on_text=on_text, on_reasoning=on_reasoning, tools=tools
+                )
                 self._write_sse(
                     chat_chunk(
                         req_id=req_id,

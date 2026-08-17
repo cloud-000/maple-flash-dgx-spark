@@ -27,6 +27,7 @@ from maple_run.server import (
     parse_chat_messages,
     parse_completion_prompt,
     parse_sampling,
+    parse_tools,
     text_completion_response,
 )
 
@@ -113,6 +114,15 @@ def test_parse_chat_and_prompt():
         parse_completion_prompt({})
 
 
+def test_parse_tools():
+    assert parse_tools({}) is None
+    assert parse_tools({"tools": None}) is None
+    tools = [{"type": "function", "function": {"name": "read_file"}}]
+    assert parse_tools({"tools": tools}) == tools
+    with pytest.raises(RequestError, match="tools"):
+        parse_tools({"tools": {"name": "x"}})
+
+
 def test_openai_response_shape():
     result = GenerateResult(
         text="Paris",
@@ -129,12 +139,33 @@ def test_openai_response_shape():
     assert chat["object"] == "chat.completion"
     assert chat["choices"][0]["message"]["content"] == "Paris"
     assert chat["choices"][0]["finish_reason"] == "stop"
+    assert "reasoning" not in chat["choices"][0]["message"]
     assert chat["usage"]["total_tokens"] == 14
     text = text_completion_response(
         result, model="maple-2bit", created=1, req_id="cmpl-x"
     )
     assert text["object"] == "text_completion"
     assert text["choices"][0]["text"] == "Paris"
+
+
+def test_openai_response_includes_reasoning():
+    result = GenerateResult(
+        text="Paris",
+        prompt_len=10,
+        n_new=8,
+        prefill_s=0.1,
+        decode_s=0.2,
+        token_ids=[1, 2, 3],
+        finish_reason="stop",
+        reasoning="the capital of France",
+    )
+    chat = chat_completion_response(
+        result, model="maple-2bit", created=1, req_id="chatcmpl-x"
+    )
+    message = chat["choices"][0]["message"]
+    assert message["content"] == "Paris"
+    assert message["reasoning"] == "the capital of France"
+    assert message["reasoning_content"] == "the capital of France"
 
 
 def test_cli_serve_help(capsys):
@@ -165,10 +196,17 @@ class FakeEngine:
         default_factory=lambda: ServerDefaults(model_id="maple-2bit")
     )
     text: str = "Hello from maple"
+    reasoning: str = ""
     last_sampling: object | None = None
+    last_tools: object | None = None
+    last_messages: object | None = None
 
-    def chat(self, messages, sampling, on_text=None):
+    def chat(self, messages, sampling, on_text=None, on_reasoning=None, tools=None):
         self.last_sampling = sampling
+        self.last_tools = tools
+        self.last_messages = messages
+        if on_reasoning is not None and self.reasoning:
+            on_reasoning(self.reasoning)
         if on_text is not None:
             on_text(self.text)
         return GenerateResult(
@@ -179,6 +217,7 @@ class FakeEngine:
             decode_s=0.02,
             token_ids=[1, 2, 3],
             finish_reason="stop",
+            reasoning=self.reasoning,
         )
 
     def complete(self, prompt, sampling, on_text=None):
@@ -334,3 +373,68 @@ def test_http_chat_stream():
         assert "Hello from maple" in payload
         assert "data: [DONE]" in payload
         assert "chat.completion.chunk" in payload
+
+
+def test_http_chat_forwards_tools_and_keeps_tool_calls():
+    engine = FakeEngine()
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "read",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    messages = [
+        {"role": "user", "content": "read foo"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\": \"foo\"}"},
+                }
+            ],
+        },
+        {"role": "tool", "content": "file contents"},
+    ]
+    with _server(engine) as port:
+        status, body, _ = _post(
+            port,
+            "/v1/chat/completions",
+            {"messages": messages, "tools": tools},
+        )
+        assert status == 200
+        assert engine.last_tools == tools
+        assert engine.last_messages[1]["tool_calls"][0]["function"]["name"] == "read_file"
+
+
+def test_http_chat_stream_reasoning():
+    engine = FakeEngine(text="Paris", reasoning="capital city")
+    with _server(engine) as port:
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        raw = json.dumps(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            }
+        ).encode()
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=raw,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(raw)),
+            },
+        )
+        resp = conn.getresponse()
+        payload = resp.read().decode()
+        conn.close()
+        assert '"reasoning": "capital city"' in payload
+        assert '"reasoning_content": "capital city"' in payload
+        assert '"content": "Paris"' in payload
