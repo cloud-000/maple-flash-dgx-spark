@@ -9,6 +9,8 @@ from pathlib import Path
 
 import torch
 
+from maple_run.kernels.sampler import MAX_TOP_K, fused_sample, sampler_workspace
+
 # CLI / generate defaults. T=0 or top-k=1 is still greedy argmax.
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TOP_P = 0.95
@@ -35,6 +37,15 @@ class GenerateResult:
 def is_greedy(temperature: float, top_k: int) -> bool:
     """True when the next token must be argmax (no multinomial)."""
     return temperature <= 0.0 or top_k == 1
+
+
+def can_fuse_sampler(temperature: float, top_p: float, top_k: int) -> bool:
+    """Whether the two-launch Triton sampler covers these settings."""
+    return (
+        not is_greedy(temperature, top_k)
+        and 0 < top_k <= MAX_TOP_K
+        and 0.0 < top_p <= 1.0
+    )
 
 
 def _nucleus(probs: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -99,10 +110,21 @@ def _next_token(
     top_p: float,
     top_k: int,
     generator: torch.Generator | None,
+    sampler_ws: tuple[torch.Tensor, ...] | None = None,
 ) -> torch.Tensor:
     last = logits[0, -1]
     if greedy:
         return last.argmax()
+    if sampler_ws is not None:
+        u = torch.rand((), device=last.device, generator=generator)
+        return fused_sample(
+            last,
+            u,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            workspace=sampler_ws,
+        )
     return sample_next(
         last,
         temperature=temperature,
@@ -140,6 +162,7 @@ def _decode_n(
     top_k: int,
     generator: torch.Generator | None,
     eos,
+    sampler_ws: tuple[torch.Tensor, ...] | None = None,
 ) -> list[int]:
     ids: list[int] = []
     for i in range(n):
@@ -150,6 +173,7 @@ def _decode_n(
             top_p=top_p,
             top_k=top_k,
             generator=generator,
+            sampler_ws=sampler_ws,
         )
         ids.append(int(next_t.item()))
         if eos is not None and ids[-1] == int(eos):
@@ -191,6 +215,7 @@ def _try_decode_graph(
     top_p: float,
     top_k: int,
     generator: torch.Generator | None,
+    sampler_ws: tuple[torch.Tensor, ...] | None = None,
 ) -> _DecodeGraph | None:
     """Capture a decode graph; keep it only if replay matches eager token ids."""
     snap = cache.snapshot()
@@ -225,6 +250,7 @@ def _try_decode_graph(
         top_k=top_k,
         generator=generator,
         eos=eos,
+        sampler_ws=sampler_ws,
     )
     cache.restore(snap)
     _rng_restore(model.device, rng_state, generator)
@@ -239,6 +265,7 @@ def _try_decode_graph(
         top_k=top_k,
         generator=generator,
         eos=eos,
+        sampler_ws=sampler_ws,
     )
     cache.restore(snap)
     _rng_restore(model.device, rng_state, generator)
@@ -312,10 +339,14 @@ def generate(
     if seed is not None and not greedy:
         generator = torch.Generator(device=model.device)
         generator.manual_seed(int(seed))
+    sampler_ws = None
+    if can_fuse_sampler(temperature, top_p, top_k):
+        sampler_ws = sampler_workspace(model.vocab_size, top_k, model.device)
     if not greedy:
         print(
             f"Sampling: temperature={temperature} top_p={top_p} "
-            f"top_k={top_k} seed={seed}",
+            f"top_k={top_k} seed={seed} "
+            f"({'fused' if sampler_ws is not None else 'torch'} sampler)",
             flush=True,
         )
 
@@ -337,6 +368,7 @@ def generate(
                 top_p=top_p,
                 top_k=top_k,
                 generator=generator,
+                sampler_ws=sampler_ws,
             )
             torch.cuda.synchronize()
         t_decode = time.perf_counter()
@@ -352,6 +384,7 @@ def generate(
                 top_p=top_p,
                 top_k=top_k,
                 generator=generator,
+                sampler_ws=sampler_ws,
             )
             pinned.copy_(next_t, non_blocking=True)
             eos_ready.record()
