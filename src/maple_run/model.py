@@ -749,8 +749,14 @@ class MapleForCausalLM:
             input_ids = input_ids.to(device=self.device, dtype=torch.long)
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
+        prompt_len = int(input_ids.shape[-1])
+        if max_tokens == -1:
+            max_ctx = int(self.config.get("max_position_embeddings", 131072))
+            max_tokens = max(max_ctx - prompt_len, 0)
+        elif max_tokens < 0:
+            raise ValueError("max_tokens must be >= 0 or -1")
 
-        cache = self.make_cache(max_len=int(input_ids.shape[-1]) + int(max_tokens))
+        cache = self.make_cache(max_len=prompt_len + max(int(max_tokens), 1))
         logits = self.forward(input_ids, cache=cache, logits_to_keep=1)
         eos = self.eos_token_id
         out = [input_ids]

@@ -88,6 +88,16 @@ def test_parse_sampling_rejects_bad_values():
         parse_sampling({"top_k": -2}, defaults)
     with pytest.raises(RequestError, match="n=1"):
         parse_sampling({"n": 2}, defaults)
+    with pytest.raises(RequestError, match="max_tokens"):
+        parse_sampling({"max_tokens": -2}, defaults)
+
+
+def test_parse_sampling_accepts_max_tokens_minus_one():
+    defaults = ServerDefaults()
+    s = parse_sampling({"max_tokens": -1}, defaults)
+    assert s.max_tokens == -1
+    s = parse_sampling({"max_completion_tokens": -1}, defaults)
+    assert s.max_tokens == -1
 
 
 def test_parse_chat_and_prompt():
@@ -275,6 +285,26 @@ def test_http_completions_and_validation():
         )
         assert status == 400
         assert "temperature" in err["error"]["message"]
+        status, body, _ = _post(
+            port,
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": -1,
+            },
+        )
+        assert status == 200
+        assert engine.last_sampling.max_tokens == -1
+        status, err, _ = _post(
+            port,
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": -2,
+            },
+        )
+        assert status == 400
+        assert "max_tokens" in err["error"]["message"]
 
 
 def test_http_chat_stream():

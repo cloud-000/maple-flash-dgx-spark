@@ -8,11 +8,13 @@ import pytest
 
 from maple_run.cli import main
 from maple_run.generate import (
+    DEFAULT_MAX_CONTEXT,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
     generate,
     is_greedy,
+    resolve_max_tokens,
     sample_next,
 )
 
@@ -92,6 +94,15 @@ def test_seed_reproducible():
     assert a != c
 
 
+def test_resolve_max_tokens_minus_one_fills_remaining_context():
+    assert resolve_max_tokens(-1, 100, DEFAULT_MAX_CONTEXT) == DEFAULT_MAX_CONTEXT - 100
+    assert resolve_max_tokens(-1, DEFAULT_MAX_CONTEXT, DEFAULT_MAX_CONTEXT) == 0
+    assert resolve_max_tokens(-1, DEFAULT_MAX_CONTEXT + 8, DEFAULT_MAX_CONTEXT) == 0
+    assert resolve_max_tokens(128, 100, DEFAULT_MAX_CONTEXT) == 128
+    with pytest.raises(ValueError, match="-1"):
+        resolve_max_tokens(-2, 10, DEFAULT_MAX_CONTEXT)
+
+
 def test_cli_rejects_bad_sampling_args():
     with pytest.raises(SystemExit):
         main(["generate", "--model", "x", "--prompt", "y", "--temperature", "-1"])
@@ -99,6 +110,8 @@ def test_cli_rejects_bad_sampling_args():
         main(["generate", "--model", "x", "--prompt", "y", "--top-p", "1.5"])
     with pytest.raises(SystemExit):
         main(["generate", "--model", "x", "--prompt", "y", "--top-k", "-2"])
+    with pytest.raises(SystemExit):
+        main(["generate", "--model", "x", "--prompt", "y", "--max-tokens", "-2"])
 
 
 def test_generate_defaults_are_sampled():
@@ -119,6 +132,7 @@ def test_cli_help_lists_sampling_defaults(capsys):
     assert "default 1.0" in out
     assert "default 0.95" in out
     assert "default 20" in out
+    assert "remaining context" in out
 
 
 @cuda

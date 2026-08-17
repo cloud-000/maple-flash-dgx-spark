@@ -114,8 +114,8 @@ def parse_sampling(body: dict, defaults: ServerDefaults) -> Sampling:
         raise RequestError("top_p must be in (0, 1]")
     if top_k < 0:
         raise RequestError("top_k must be >= 0")
-    if max_tokens < 0:
-        raise RequestError("max_tokens must be >= 0")
+    if max_tokens < -1:
+        raise RequestError("max_tokens must be >= 0 or -1")
     return Sampling(
         temperature=temperature,
         top_p=top_p,

@@ -9,7 +9,12 @@ from maple_run import __version__
 
 
 def _add_sampling_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=128,
+        help="Max new tokens (default 128). -1 fills remaining context",
+    )
     parser.add_argument(
         "--temperature",
         type=float,
@@ -49,8 +54,8 @@ def _validate_sampling_args(parser: argparse.ArgumentParser, args: argparse.Name
         parser.error("--top-p must be in (0, 1]")
     if args.top_k < 0:
         parser.error("--top-k must be >= 0")
-    if args.max_tokens < 0:
-        parser.error("--max-tokens must be >= 0")
+    if args.max_tokens < -1:
+        parser.error("--max-tokens must be >= 0 or -1")
 
 
 def main(argv: list[str] | None = None) -> int:

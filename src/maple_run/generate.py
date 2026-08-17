@@ -16,6 +16,17 @@ from maple_run.kernels.sampler import MAX_TOP_K, fused_sample, sampler_workspace
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TOP_P = 0.95
 DEFAULT_TOP_K = 20
+DEFAULT_MAX_CONTEXT = 131072
+
+
+def resolve_max_tokens(max_tokens: int, prompt_len: int, max_context: int) -> int:
+    """Map a request cap onto remaining context. ``-1`` means no extra cap."""
+    remaining = max(int(max_context) - int(prompt_len), 0)
+    if max_tokens == -1:
+        return remaining
+    if max_tokens < 0:
+        raise ValueError("max_tokens must be >= 0 or -1")
+    return int(max_tokens)
 
 
 @dataclass
@@ -417,6 +428,12 @@ def run_generate(
         input_ids = input_ids.unsqueeze(0)
     input_ids = input_ids.to(model.device).long()
     prompt_len = int(input_ids.shape[-1])
+    max_context = int(
+        (getattr(model, "config", None) or {}).get(
+            "max_position_embeddings", DEFAULT_MAX_CONTEXT
+        )
+    )
+    max_tokens = resolve_max_tokens(max_tokens, prompt_len, max_context)
     greedy = is_greedy(temperature, top_k)
     generator = None
     if seed is not None and not greedy:
