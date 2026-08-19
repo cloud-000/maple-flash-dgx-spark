@@ -801,6 +801,20 @@ class BucketedDecodeGraphs:
         self.graphs[w].replay()
         return self.next_id[w][:live]
 
+    def replay_logits(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Step ``tokens`` ``[live, 1]``; returns last-token logits ``[live, vocab]``.
+
+        Ignores the in-graph sample (greedy argmax or fused draw). A scheduler
+        that mixes per-request sampling reads these logits and samples outside.
+        """
+        live = int(tokens.shape[0])
+        w = self.width_for(live)
+        self.token_ids[:live].copy_(tokens.reshape(live, 1))
+        if live < w:
+            self.token_ids[live:w].zero_()
+        self.graphs[w].replay()
+        return self.logits[w][:live].reshape(live, -1)
+
 
 @dataclass
 class BatchedResult:

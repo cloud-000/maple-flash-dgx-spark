@@ -20,6 +20,7 @@ from maple_run.generate import (
     message_text,
 )
 from maple_run.server import (
+    PackedEngine,
     RequestError,
     ServerDefaults,
     apply_system_prompt,
@@ -33,6 +34,7 @@ from maple_run.server import (
 )
 
 torch = pytest.importorskip("torch")
+cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def test_message_text_flattens_parts():
@@ -219,6 +221,10 @@ def test_cli_serve_help(capsys):
     assert "default 0.95" in out
     assert "default 20" in out
     assert "--flash-head" in out
+    assert "--max-batch" in out
+    assert "--max-len" in out
+    assert "(default 8)" in out
+    assert "(default 8192)" in out
 
 
 def test_cli_serve_rejects_bad_sampling():
@@ -226,6 +232,10 @@ def test_cli_serve_rejects_bad_sampling():
         main(["serve", "--model", "x", "--temperature", "-1"])
     with pytest.raises(SystemExit):
         main(["serve", "--model", "x", "--port", "99999"])
+    with pytest.raises(SystemExit):
+        main(["serve", "--model", "x", "--max-batch", "0"])
+    with pytest.raises(SystemExit):
+        main(["serve", "--model", "x", "--max-len", "0"])
 
 
 @dataclass
@@ -534,3 +544,80 @@ def test_http_chat_emits_openai_tool_calls():
         assert '"tool_calls"' in payload
         assert '"name": "read"' in payload
         assert '"index": 0' in payload
+
+
+def _tiny_batch_model(seed: int = 11):
+    from tests.test_model import _tiny_batch_model as factory
+
+    return factory(seed)
+
+
+@cuda
+def test_scheduler_overlapping_jobs_match_solo():
+    """Three jobs, two slots: the waiter joins a freed slot without perturbing others."""
+    from maple_run.generate import batched_generate
+
+    model, cfg = _tiny_batch_model(seed=31)
+    torch.manual_seed(9)
+    prompts = [
+        torch.randint(1, cfg["vocab_size"], (n,), device="cuda") for n in (4, 9, 6)
+    ]
+    caps = (8, 12, 8)
+    solo = [
+        batched_generate(
+            model, [p], max_tokens=m, stop_ids=set(), log=lambda _m: None
+        ).token_ids[0]
+        for p, m in zip(prompts, caps)
+    ]
+    engine = PackedEngine(
+        model, None, ServerDefaults(max_batch=2, max_len=64, model_id="tiny")
+    )
+    try:
+        engine.wait_ready()
+        got: list = [None] * 3
+
+        def go(i: int) -> None:
+            got[i] = engine.run(
+                prompts[i],
+                max_tokens=caps[i],
+                temperature=0.0,
+                top_k=1,
+                stop_ids=set(),
+            )
+
+        threads = [threading.Thread(target=go, args=(i,)) for i in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+            assert not t.is_alive()
+        for i in range(3):
+            assert got[i] is not None, f"job {i} produced no result"
+            assert got[i].token_ids == solo[i], f"job {i} diverged from solo"
+    finally:
+        engine.close()
+
+
+@cuda
+def test_scheduler_padding_seqlen_stays_reset():
+    """A width-2 graph with one live row must not grow the free slot's seqlen."""
+    model, cfg = _tiny_batch_model()
+    prompt = torch.randint(1, cfg["vocab_size"], (2,), device="cuda")
+    engine = PackedEngine(
+        model, None, ServerDefaults(max_batch=2, max_len=16, model_id="tiny")
+    )
+    try:
+        engine.wait_ready()
+        engine.run(
+            prompt, max_tokens=12, temperature=0.0, top_k=1, stop_ids=set()
+        )
+        assert engine._live == 0
+        assert engine._cache.seen[1] == 0
+        assert int(engine._cache.seqlen[1]) == 0
+        # Second request reuses a slot; padding from the first run must not overflow.
+        second = engine.run(
+            prompt, max_tokens=12, temperature=0.0, top_k=1, stop_ids=set()
+        )
+        assert len(second.token_ids) == 12
+    finally:
+        engine.close()

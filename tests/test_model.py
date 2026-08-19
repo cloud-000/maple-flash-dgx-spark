@@ -460,6 +460,32 @@ def test_bucketed_graphs_narrow_as_rows_finish():
 
 
 @cuda
+def test_reset_slot_then_new_prompt_is_independent():
+    """A slot that already decoded must not leak K/V into the next sequence."""
+    model, cfg = _tiny_batch_model()
+    torch.manual_seed(0)
+    prompt_a = torch.randint(1, cfg["vocab_size"], (5,), device="cuda")
+    prompt_b = torch.randint(1, cfg["vocab_size"], (7,), device="cuda")
+    cache = model.make_cache(max_len=32, batch=1)
+    with torch.inference_mode():
+        with cache.prefill_slot(0):
+            model.forward(prompt_a.view(1, -1), cache=cache, logits_to_keep=1)
+        nxt = torch.randint(1, cfg["vocab_size"], (1, 1), device="cuda")
+        model.forward(nxt, cache=cache, logits_to_keep=1)
+        assert cache.seen[0] == 6
+        cache.reset_slot(0)
+        with cache.prefill_slot(0):
+            reused = model.forward(prompt_b.view(1, -1), cache=cache, logits_to_keep=1)
+    fresh = model.make_cache(max_len=32, batch=1)
+    with torch.inference_mode():
+        with fresh.prefill_slot(0):
+            want = model.forward(prompt_b.view(1, -1), cache=fresh, logits_to_keep=1)
+    assert torch.equal(reused, want)
+    assert cache.seen[0] == 7
+    assert cache.seqlen[0].item() == 7
+
+
+@cuda
 def test_batched_sampled_decode_gives_each_row_its_own_draw():
     from maple_run.generate import batched_generate
 

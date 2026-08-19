@@ -195,6 +195,18 @@ def main(argv: list[str] | None = None) -> int:
         default=8000,
         help="Bind port (default 8000)",
     )
+    serve.add_argument(
+        "--max-batch",
+        type=int,
+        default=8,
+        help="Concurrent decode slots (default 8)",
+    )
+    serve.add_argument(
+        "--max-len",
+        type=int,
+        default=8192,
+        help="KV cache length per slot, prompt + new tokens (default 8192)",
+    )
     _add_sampling_args(serve)
 
     args = parser.parse_args(argv)
@@ -273,6 +285,10 @@ def main(argv: list[str] | None = None) -> int:
         _validate_sampling_args(parser, args)
         if args.port < 0 or args.port > 65535:
             parser.error("--port must be in 0..65535")
+        if args.max_batch < 1:
+            parser.error("--max-batch must be >= 1")
+        if args.max_len < 1:
+            parser.error("--max-len must be >= 1")
         from maple_run.server import serve
 
         serve(
@@ -285,6 +301,8 @@ def main(argv: list[str] | None = None) -> int:
             max_tokens=args.max_tokens,
             seed=args.seed,
             flash_head=args.flash_head,
+            max_batch=args.max_batch,
+            max_len=args.max_len,
         )
         return 0
     parser.error(f"unknown command {args.cmd}")

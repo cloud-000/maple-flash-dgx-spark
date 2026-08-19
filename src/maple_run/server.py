@@ -1,35 +1,56 @@
 """OpenAI-compatible HTTP server for a packed Maple checkpoint.
 
-Stdlib only. One CUDA generate at a time. Request body may override the
-CLI sampling defaults (temperature, top_p, top_k, max_tokens, seed).
+Stdlib HTTP. A CUDA worker continuously batches requests into KV-cache slots.
+Request body may override the CLI sampling defaults (temperature, top_p,
+top_k, max_tokens, seed).
 """
 
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import torch
+
 from maple_run.generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
+    CompletionDecoder,
     GenerateResult,
+    _first_batched_id,
+    _try_batched_decode_graphs,
+    can_fuse_sampler,
     describe_chat_prompt,
     encode_messages,
     encode_prompt,
+    is_greedy,
     load_packed,
     log_model_traffic,
-    run_generate,
+    prompt_in_think,
+    resolve_max_tokens,
+    sample_next,
+    skip_decode_ids,
+    stop_token_ids,
     warmup_model,
 )
+from maple_run.kernels.sampler import (
+    MAX_TOP_K,
+    batched_sampler_workspace,
+    fused_sample_batched,
+)
+
+DEFAULT_MAX_BATCH = 8
+DEFAULT_MAX_LEN = 8192
 
 _MAX_BODY = 16 * 1024 * 1024
 
@@ -51,6 +72,8 @@ class ServerDefaults:
     seed: int | None = None
     flash_head: bool = False
     model_id: str = "maple-2bit"
+    max_batch: int = DEFAULT_MAX_BATCH
+    max_len: int = DEFAULT_MAX_LEN
 
 
 @dataclass(frozen=True)
@@ -294,15 +317,70 @@ def models_list(model_id: str) -> dict:
     }
 
 
+@dataclass
+class _Job:
+    input_ids: Any
+    sampling: Sampling
+    on_text: Callable[[str], None] | None = None
+    on_reasoning: Callable[[str], None] | None = None
+    on_tool_calls: Callable[[list[dict]], None] | None = None
+    stop_ids: set[int] | None = None
+    done: threading.Event = field(default_factory=threading.Event)
+    result: GenerateResult | None = None
+    error: BaseException | None = None
+
+
+@dataclass
+class _Slot:
+    job: _Job
+    pending: int
+    max_tokens: int
+    prompt_len: int
+    prefill_s: float
+    decode_t0: float
+    token_ids: list[int] = field(default_factory=list)
+    decoder: CompletionDecoder | None = None
+    stop_ids: set[int] = field(default_factory=set)
+    generator: Any = None
+    finish_reason: str = "length"
+
+
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 class PackedEngine:
-    """Load once, generate under a lock. ``on_text`` receives decoded deltas."""
+    """Load once; a CUDA worker admits requests into persistent cache slots."""
 
     def __init__(self, model, tokenizer, defaults: ServerDefaults):
         self.model = model
         self.tokenizer = tokenizer
         self.defaults = defaults
-        self._lock = threading.Lock()
-        self._warmed = False
+        self.max_batch = int(defaults.max_batch)
+        self.max_len = int(defaults.max_len)
+        self._queue: queue.Queue[_Job | None] = queue.Queue()
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._start_error: BaseException | None = None
+        self._live = 0
+        self._slots: list[_Slot | None] = [None] * self.max_batch
+        self._cache = None
+        self._runner = None
+        self._sample_ws = None
+        self._worker = threading.Thread(
+            target=self._run, name="maple-batch", daemon=True
+        )
+        self._worker.start()
+
+    def wait_ready(self) -> None:
+        self._ready.wait()
+        if self._start_error is not None:
+            raise self._start_error
+
+    def close(self) -> None:
+        self._stop.set()
+        self._queue.put(None)
+        self._worker.join(timeout=30)
 
     def chat(
         self,
@@ -313,11 +391,15 @@ class PackedEngine:
         on_tool_calls: Callable[[list[dict]], None] | None = None,
         tools: list | None = None,
     ) -> GenerateResult:
+        if self.tokenizer is None:
+            raise RuntimeError("PackedEngine.chat needs a tokenizer")
         input_ids = encode_messages(
             self.tokenizer, messages, self.model.device, tools=tools
         )
         print(describe_chat_prompt(self.tokenizer, input_ids, tools), flush=True)
-        return self._generate(input_ids, sampling, on_text, on_reasoning, on_tool_calls)
+        return self._submit(
+            input_ids, sampling, on_text, on_reasoning, on_tool_calls
+        )
 
     def complete(
         self,
@@ -325,29 +407,401 @@ class PackedEngine:
         sampling: Sampling,
         on_text: Callable[[str], None] | None = None,
     ) -> GenerateResult:
+        if self.tokenizer is None:
+            raise RuntimeError("PackedEngine.complete needs a tokenizer")
         input_ids = encode_prompt(self.tokenizer, prompt, self.model.device)
-        return self._generate(input_ids, sampling, on_text)
+        return self._submit(input_ids, sampling, on_text)
 
-    def _generate(
-        self, input_ids, sampling: Sampling, on_text, on_reasoning=None, on_tool_calls=None
+    def run(
+        self,
+        input_ids,
+        *,
+        max_tokens: int = 128,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 1,
+        seed: int | None = None,
+        stop_ids: set[int] | None = None,
     ) -> GenerateResult:
-        with self._lock:
-            if not self._warmed:
-                warmup_model(self.model, flash_head=self.defaults.flash_head)
-                self._warmed = True
-            return run_generate(
-                self.model,
-                self.tokenizer,
-                input_ids,
-                max_tokens=sampling.max_tokens,
-                temperature=sampling.temperature,
-                top_p=sampling.top_p,
-                top_k=sampling.top_k,
-                seed=sampling.seed,
-                on_text=on_text,
-                on_reasoning=on_reasoning,
-                on_tool_calls=on_tool_calls,
+        """Decode ``input_ids`` on the worker. Used by tests; no tokenizer needed."""
+        sampling = Sampling(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_tokens=max_tokens,
+            seed=seed,
+            stream=False,
+            model=self.defaults.model_id,
+        )
+        return self._submit(input_ids, sampling, stop_ids=stop_ids)
+
+    def _submit(
+        self,
+        input_ids,
+        sampling: Sampling,
+        on_text=None,
+        on_reasoning=None,
+        on_tool_calls=None,
+        stop_ids: set[int] | None = None,
+    ) -> GenerateResult:
+        self.wait_ready()
+        job = _Job(
+            input_ids=input_ids,
+            sampling=sampling,
+            on_text=on_text,
+            on_reasoning=on_reasoning,
+            on_tool_calls=on_tool_calls,
+            stop_ids=stop_ids,
+        )
+        self._queue.put(job)
+        job.done.wait()
+        if job.error is not None:
+            raise job.error
+        assert job.result is not None
+        return job.result
+
+    def _run(self) -> None:
+        try:
+            self._setup()
+        except Exception as exc:
+            self._start_error = exc
+            self._ready.set()
+            return
+        self._ready.set()
+        try:
+            with torch.inference_mode():
+                while True:
+                    if not self._admit():
+                        break
+                    if self._live == 0:
+                        continue
+                    self._emit_and_retire()
+                    if self._live == 0:
+                        continue
+                    if self._stop.is_set():
+                        self._drain_stop()
+                        break
+                    self._decode_step()
+        except Exception as exc:
+            self._fail_all(exc)
+
+    def _setup(self) -> None:
+        model = self.model
+        device = getattr(model, "device", None)
+        if (
+            torch.cuda.is_available()
+            and isinstance(device, torch.device)
+            and device.type == "cuda"
+            and device.index is not None
+        ):
+            torch.cuda.set_device(device)
+        warmup_model(model, flash_head=False)
+        flash = getattr(model, "lm_head_flash", None)
+        if flash is not None:
+            model.lm_head_flash = None
+            _log("continuous batch uses exact lm_head (FlashHead is B=1 only)")
+        self._cache = model.make_cache(max_len=self.max_len, batch=self.max_batch)
+        dummy = torch.zeros(1, dtype=torch.long, device=model.device)
+        pending: list[int] = []
+        for b in range(self.max_batch):
+            with self._cache.prefill_slot(b):
+                logits = model.forward(
+                    dummy.view(1, -1), cache=self._cache, logits_to_keep=1
+                )
+            pending.append(int(logits[0, -1].argmax()))
+        self._cache.remap = True
+        self._runner = _try_batched_decode_graphs(
+            model, self._cache, pending, sample=None, log=_log
+        )
+        for b in range(self.max_batch):
+            self._cache.reset_slot(b)
+        self._sample_ws = batched_sampler_workspace(
+            int(model.config["vocab_size"]),
+            MAX_TOP_K,
+            self.max_batch,
+            model.device,
+        )
+
+    def _admit(self) -> bool:
+        """Fill free slots from the queue. False means the worker should exit."""
+        while self._live < self.max_batch:
+            if self._stop.is_set():
+                self._drain_stop()
+                return False
+            if self._live == 0:
+                job = self._queue.get()
+            else:
+                try:
+                    job = self._queue.get_nowait()
+                except queue.Empty:
+                    return True
+            if job is None:
+                self._drain_stop()
+                return False
+            self._admit_job(job)
+        return True
+
+    def _drain_stop(self) -> None:
+        while True:
+            try:
+                leftover = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if leftover is not None:
+                leftover.error = RuntimeError("engine stopped")
+                leftover.done.set()
+        for slot in range(self._live):
+            row = self._slots[slot]
+            if row is not None:
+                self._finish_slot(slot, error=RuntimeError("engine stopped"))
+        self._live = 0
+
+    def _admit_job(self, job: _Job) -> None:
+        ids = torch.as_tensor(
+            job.input_ids, device=self.model.device, dtype=torch.long
+        ).reshape(-1)
+        prompt_len = int(ids.numel())
+        if prompt_len >= self.max_len:
+            job.error = RequestError(
+                f"prompt length {prompt_len} exceeds max_len {self.max_len}"
             )
+            job.done.set()
+            return
+        max_tokens = resolve_max_tokens(job.sampling.max_tokens, prompt_len, self.max_len)
+        if max_tokens <= 0:
+            job.result = GenerateResult(
+                text="",
+                prompt_len=prompt_len,
+                n_new=0,
+                prefill_s=0.0,
+                decode_s=0.0,
+                finish_reason="length",
+            )
+            job.done.set()
+            return
+        slot = self._live
+        self._cache.reset_slot(slot)
+        t0 = time.perf_counter()
+        with self._cache.prefill_slot(slot):
+            logits = self.model.forward(
+                ids.view(1, -1), cache=self._cache, logits_to_keep=1
+            )
+        prefill_s = time.perf_counter() - t0
+        sampling = job.sampling
+        gen = None
+        if sampling.seed is not None and not is_greedy(
+            sampling.temperature, sampling.top_k
+        ):
+            gen = torch.Generator(device=self.model.device)
+            gen.manual_seed(int(sampling.seed))
+        pending = int(
+            self._first_id(logits, sampling, gen)
+        )
+        stop = (
+            job.stop_ids
+            if job.stop_ids is not None
+            else stop_token_ids(self.model, self.tokenizer)
+        )
+        decoder = None
+        if self.tokenizer is not None:
+            decoder = CompletionDecoder(
+                self.tokenizer,
+                in_think=prompt_in_think(self.tokenizer, ids),
+                skip_ids=skip_decode_ids(self.tokenizer, extra=stop),
+            )
+        self._slots[slot] = _Slot(
+            job=job,
+            pending=pending,
+            max_tokens=max_tokens,
+            prompt_len=prompt_len,
+            prefill_s=prefill_s,
+            decode_t0=time.perf_counter(),
+            decoder=decoder,
+            stop_ids=stop,
+            generator=gen,
+        )
+        self._live += 1
+
+    def _first_id(self, logits, sampling: Sampling, gen):
+        greedy = is_greedy(sampling.temperature, sampling.top_k)
+        if greedy or can_fuse_sampler(
+            sampling.temperature, sampling.top_p, sampling.top_k
+        ):
+            return _first_batched_id(
+                logits,
+                greedy,
+                sampling.temperature,
+                sampling.top_p,
+                sampling.top_k,
+                gen,
+            )
+        last = logits[0, -1]
+        return sample_next(
+            last,
+            temperature=sampling.temperature,
+            top_p=sampling.top_p,
+            top_k=sampling.top_k,
+            generator=gen,
+        )
+
+    def _emit_and_retire(self) -> None:
+        finished: list[int] = []
+        for slot in range(self._live):
+            row = self._slots[slot]
+            assert row is not None
+            tok = row.pending
+            row.token_ids.append(tok)
+            try:
+                if row.decoder is not None:
+                    r_delta, c_delta = row.decoder.push(tok)
+                    if r_delta and row.job.on_reasoning is not None:
+                        row.job.on_reasoning(r_delta)
+                    if c_delta and row.job.on_text is not None:
+                        row.job.on_text(c_delta)
+                    new_calls = row.decoder.take_new_tool_calls()
+                    if new_calls and row.job.on_tool_calls is not None:
+                        row.job.on_tool_calls(new_calls)
+            except Exception as exc:
+                row.job.error = exc
+                finished.append(slot)
+                continue
+            if tok in row.stop_ids:
+                row.finish_reason = "stop"
+                finished.append(slot)
+            elif row.decoder is not None and row.decoder.should_stop:
+                row.finish_reason = (
+                    "tool_calls" if row.decoder.tool_calls else "stop"
+                )
+                finished.append(slot)
+            elif len(row.token_ids) >= row.max_tokens:
+                row.finish_reason = "length"
+                finished.append(slot)
+        for slot in reversed(finished):
+            last = self._live - 1
+            if slot != last:
+                self._cache.swap_slots(slot, last)
+                self._slots[slot], self._slots[last] = (
+                    self._slots[last],
+                    self._slots[slot],
+                )
+            self._finish_slot(last)
+            self._cache.reset_slot(last)
+            self._slots[last] = None
+            self._live -= 1
+
+    def _finish_slot(
+        self, slot: int, error: BaseException | None = None
+    ) -> None:
+        row = self._slots[slot]
+        if row is None:
+            return
+        job = row.job
+        if error is not None and job.error is None:
+            job.error = error
+        if job.result is None and job.error is None:
+            reasoning = text = ""
+            finish = row.finish_reason
+            if row.decoder is not None:
+                reasoning, text = row.decoder.finalize()
+                if row.decoder.tool_calls:
+                    finish = "tool_calls"
+            decode_s = max(time.perf_counter() - row.decode_t0, 0.0)
+            job.result = GenerateResult(
+                text=text,
+                prompt_len=row.prompt_len,
+                n_new=len(row.token_ids),
+                prefill_s=row.prefill_s,
+                decode_s=decode_s,
+                token_ids=list(row.token_ids),
+                finish_reason=finish,
+                reasoning=reasoning,
+                tool_calls=list(row.decoder.tool_calls) if row.decoder else [],
+            )
+        job.done.set()
+
+    def _decode_step(self) -> None:
+        live = self._live
+        device = self.model.device
+        tokens = torch.tensor(
+            [self._slots[s].pending for s in range(live)],
+            device=device,
+            dtype=torch.long,
+        ).view(live, 1)
+        if self._runner is not None:
+            logits = self._runner.replay_logits(tokens)
+            width = self._runner.width_for(live)
+            self._cache.advance_host(1, live)
+            for s in range(live, width):
+                self._cache.reset_slot(s)
+        else:
+            logits = self.model.forward(
+                tokens, cache=self._cache, logits_to_keep=1
+            )[:, -1, :]
+        nxt = self._sample_rows(logits)
+        for s, tok in enumerate(nxt):
+            self._slots[s].pending = int(tok)
+
+    def _sample_rows(self, logits) -> list[int]:
+        live = logits.shape[0]
+        nxt = torch.empty(live, dtype=torch.long, device=logits.device)
+        greedy_idx: list[int] = []
+        groups: dict[tuple[float, float, int], list[int]] = {}
+        for s in range(live):
+            row = self._slots[s]
+            assert row is not None
+            sampling = row.job.sampling
+            if is_greedy(sampling.temperature, sampling.top_k):
+                greedy_idx.append(s)
+            else:
+                key = (sampling.temperature, sampling.top_p, sampling.top_k)
+                groups.setdefault(key, []).append(s)
+        if greedy_idx:
+            idx = torch.tensor(greedy_idx, device=logits.device, dtype=torch.long)
+            nxt[idx] = logits[idx].argmax(dim=-1)
+        for (temperature, top_p, top_k), idxs in groups.items():
+            idx = torch.tensor(idxs, device=logits.device, dtype=torch.long)
+            rows = logits[idx]
+            gens = [self._slots[i].generator for i in idxs]
+            u = torch.empty(len(idxs), device=logits.device)
+            for n, gen in enumerate(gens):
+                u[n] = torch.rand((), device=logits.device, generator=gen)
+            if can_fuse_sampler(temperature, top_p, top_k):
+                sampled = fused_sample_batched(
+                    rows,
+                    u,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    workspace=self._sample_ws,
+                )
+            else:
+                sampled = torch.stack(
+                    [
+                        sample_next(
+                            rows[n],
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k,
+                            generator=gens[n],
+                        )
+                        for n in range(len(idxs))
+                    ]
+                )
+            nxt[idx] = sampled
+        return [int(x) for x in nxt.tolist()]
+
+    def _fail_all(self, exc: BaseException) -> None:
+        for slot in range(self._live):
+            self._finish_slot(slot, error=exc)
+        self._live = 0
+        while True:
+            try:
+                job = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if job is not None:
+                job.error = exc
+                job.done.set()
 
 
 def _sse(payload: dict) -> bytes:
@@ -617,6 +1071,8 @@ def serve(
     max_tokens: int = 128,
     seed: int | None = None,
     flash_head: bool = False,
+    max_batch: int = DEFAULT_MAX_BATCH,
+    max_len: int = DEFAULT_MAX_LEN,
     engine: PackedEngine | None = None,
 ) -> None:
     """Load the packed model (unless ``engine`` is given) and serve forever."""
@@ -629,14 +1085,15 @@ def serve(
         seed=seed,
         flash_head=flash_head,
         model_id=Path(model_dir).name,
+        max_batch=max_batch,
+        max_len=max_len,
     )
     if engine is None:
         print(f"Loading packed model from {model_dir}", flush=True)
         model, tokenizer = load_packed(model_dir, flash_head=flash_head)
         log_model_traffic(model, flash_head=flash_head)
         engine = PackedEngine(model, tokenizer, defaults)
-        warmup_model(model, flash_head=flash_head)
-        engine._warmed = True
+        engine.wait_ready()
     httpd = _Server((host, port), make_handler(engine))
     actual_host, actual_port = httpd.server_address[:2]
     print(
@@ -647,7 +1104,8 @@ def serve(
     print(
         f"Defaults: temperature={defaults.temperature} top_p={defaults.top_p} "
         f"top_k={defaults.top_k} max_tokens={defaults.max_tokens} "
-        f"seed={defaults.seed} flash_head={defaults.flash_head}",
+        f"seed={defaults.seed} flash_head={defaults.flash_head} "
+        f"max_batch={defaults.max_batch} max_len={defaults.max_len}",
         flush=True,
     )
     try:
@@ -656,3 +1114,5 @@ def serve(
         print("\nShutting down", flush=True)
     finally:
         httpd.server_close()
+        if isinstance(engine, PackedEngine):
+            engine.close()
