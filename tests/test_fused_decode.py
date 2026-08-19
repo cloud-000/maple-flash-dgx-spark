@@ -221,3 +221,141 @@ def test_decode_attn_does_not_need_padded_tail():
     )
     torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
 
+
+
+def _decode_attn_fixture(bsz, lens, *, n_q=8, n_kv=2, d=64, max_len=1024, rotary_dim=32):
+    """Random qkv + a cache where row ``b`` already holds ``lens[b]`` tokens."""
+    torch.manual_seed(7)
+    q_w = torch.randn(d, device="cuda")
+    k_w = torch.randn(d, device="cuda")
+    qkv = torch.randn(bsz, (n_q + 2 * n_kv) * d, device="cuda", dtype=torch.bfloat16)
+    k_cache = torch.zeros(bsz, n_kv, max_len, d, device="cuda", dtype=torch.bfloat16)
+    v_cache = torch.zeros(bsz, n_kv, max_len, d, device="cuda", dtype=torch.bfloat16)
+    for b, n in enumerate(lens):
+        k_cache[b, :, :n] = torch.randn(n_kv, n, d, device="cuda", dtype=torch.bfloat16)
+        v_cache[b, :, :n] = torch.randn(n_kv, n, d, device="cuda", dtype=torch.bfloat16)
+    seqlen = torch.tensor(lens, device="cuda", dtype=torch.int64)
+    cos = torch.randn(bsz, 1, rotary_dim, device="cuda", dtype=torch.bfloat16)
+    sin = torch.randn(bsz, 1, rotary_dim, device="cuda", dtype=torch.bfloat16)
+    return q_w, k_w, qkv, k_cache, v_cache, seqlen, cos, sin
+
+
+# Lengths that straddle a BLOCK_T (64) boundary and the split-K threshold, so a
+# batch cannot accidentally pass by every row taking the same code path.
+_RAGGED = [1, 63, 64, 65, 300, 511, 1000]
+
+
+@cuda
+@pytest.mark.parametrize("window", [None, 512])
+def test_batched_decode_attn_matches_per_row_batch1(window):
+    """Each row must be bit-identical to the same row run alone at B=1.
+
+    The batch is a grid dimension here: rows share no arithmetic, so anything
+    less than exact equality would mean a stride or a ``seqlen[b]`` is wrong.
+    """
+    from maple_run.kernels.decode_attn import apply_qkv_decode, decode_gqa_attn
+
+    lens = _RAGGED
+    bsz, n_q, n_kv, d, rot = len(lens), 8, 2, 64, 32
+    q_w, k_w, qkv, k0, v0, seqlen, cos, sin = _decode_attn_fixture(bsz, lens)
+    kb, vb = k0.clone(), v0.clone()
+    kw = dict(
+        num_heads=n_q,
+        num_kv_heads=n_kv,
+        head_dim=d,
+        rotary_dim=rot,
+        use_rope=True,
+        use_qk_norm=True,
+        eps=1e-6,
+    )
+    q = apply_qkv_decode(qkv, q_w, k_w, cos, sin, kb, vb, seqlen, **kw)
+    out = decode_gqa_attn(q, kb, vb, seqlen, scale=d**-0.5, window=window)
+
+    for b in range(bsz):
+        k1, v1 = k0[b : b + 1].clone(), v0[b : b + 1].clone()
+        q1 = apply_qkv_decode(
+            qkv[b : b + 1],
+            q_w,
+            k_w,
+            cos[b : b + 1],
+            sin[b : b + 1],
+            k1,
+            v1,
+            seqlen[b : b + 1],
+            **kw,
+        )
+        o1 = decode_gqa_attn(q1, k1, v1, seqlen[b : b + 1], scale=d**-0.5, window=window)
+        assert torch.equal(q[b : b + 1], q1), f"row {b} q"
+        assert torch.equal(kb[b : b + 1], k1), f"row {b} K write"
+        assert torch.equal(vb[b : b + 1], v1), f"row {b} V write"
+        assert torch.equal(out[b : b + 1], o1), f"row {b} attention out"
+
+
+@cuda
+def test_batched_decode_attn_matches_sdpa_per_row():
+    from maple_run.kernels.decode_attn import apply_qkv_decode, decode_gqa_attn
+
+    lens = _RAGGED
+    bsz, n_q, n_kv, d, rot = len(lens), 8, 2, 64, 32
+    q_w, k_w, qkv, k0, v0, seqlen, cos, sin = _decode_attn_fixture(bsz, lens)
+    q = apply_qkv_decode(
+        qkv,
+        q_w,
+        k_w,
+        cos,
+        sin,
+        k0,
+        v0,
+        seqlen,
+        num_heads=n_q,
+        num_kv_heads=n_kv,
+        head_dim=d,
+        rotary_dim=rot,
+        use_rope=True,
+        use_qk_norm=True,
+        eps=1e-6,
+    )
+    out = decode_gqa_attn(q, k0, v0, seqlen, scale=d**-0.5, window=None)
+    for b, n in enumerate(lens):
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q[b : b + 1].float(),
+            k0[b : b + 1, :, : n + 1].float(),
+            v0[b : b + 1, :, : n + 1].float(),
+            scale=d**-0.5,
+            enable_gqa=True,
+        )
+        torch.testing.assert_close(
+            out[b : b + 1].float(), ref, rtol=2e-2, atol=2e-2
+        )
+
+
+@cuda
+def test_batched_decode_attn_ignores_other_rows_cache():
+    """Row ``b``'s output must not move when another row's cache changes."""
+    from maple_run.kernels.decode_attn import apply_qkv_decode, decode_gqa_attn
+
+    lens = [5, 200, 900]
+    bsz, n_q, n_kv, d, rot = len(lens), 8, 2, 64, 32
+    q_w, k_w, qkv, k0, v0, seqlen, cos, sin = _decode_attn_fixture(bsz, lens)
+    kw = dict(
+        num_heads=n_q,
+        num_kv_heads=n_kv,
+        head_dim=d,
+        rotary_dim=rot,
+        use_rope=True,
+        use_qk_norm=True,
+        eps=1e-6,
+    )
+    ka, va = k0.clone(), v0.clone()
+    q = apply_qkv_decode(qkv, q_w, k_w, cos, sin, ka, va, seqlen, **kw)
+    out_a = decode_gqa_attn(q, ka, va, seqlen, scale=d**-0.5, window=None)
+
+    kb, vb = k0.clone(), v0.clone()
+    kb[1] = torch.randn_like(kb[1])
+    vb[1] = torch.randn_like(vb[1])
+    q = apply_qkv_decode(qkv, q_w, k_w, cos, sin, kb, vb, seqlen, **kw)
+    out_b = decode_gqa_attn(q, kb, vb, seqlen, scale=d**-0.5, window=None)
+
+    for b in (0, 2):
+        assert torch.equal(out_a[b], out_b[b]), f"row {b} moved with row 1's cache"
+    assert not torch.equal(out_a[1], out_b[1])

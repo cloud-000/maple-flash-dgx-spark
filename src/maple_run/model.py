@@ -14,6 +14,7 @@ activations still need an attention kernel (SDPA/FlashInfer/Triton), not Dao
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -133,46 +134,103 @@ class KVCache:
             torch.zeros(batch, n_kv, max_len, head_dim, dtype=dtype, device=device)
             for _ in range(n)
         ]
-        self.seqlen = torch.zeros((), dtype=torch.int64, device=device)
-        self.seen = 0
+        self.batch = batch
+        # One write index per row: rows admitted to a decode batch at different
+        # times sit at different lengths, and the decode kernels read
+        # ``seqlen[b]`` rather than a shared scalar.
+        self.seqlen = torch.zeros(batch, dtype=torch.int64, device=device)
+        self.seen = [0] * batch
+        # Row a batch-1 prefill writes into; ``None`` means the whole batch,
+        # which is what the eager SDPA path and every B=1 caller want.
+        self.slot: int | None = None
         # Split-attention partials, shared by every layer (attention is
         # sequential) and preallocated so decode allocates nothing per step.
         n_heads = n_heads if n_heads is not None else n_kv
         splits = max(gqa_splits(max_len, window), gqa_splits(max_len, None))
         self.attn_ws = (
-            torch.empty(splits, n_heads, head_dim, dtype=torch.float32, device=device),
-            torch.empty(splits, n_heads, dtype=torch.float32, device=device),
-            torch.empty(splits, n_heads, dtype=torch.float32, device=device),
+            torch.empty(
+                batch, splits, n_heads, head_dim, dtype=torch.float32, device=device
+            ),
+            torch.empty(batch, splits, n_heads, dtype=torch.float32, device=device),
+            torch.empty(batch, splits, n_heads, dtype=torch.float32, device=device),
         )
+
+    @contextmanager
+    def prefill_slot(self, row: int):
+        """Route one batch-1 forward at rows ``[row]`` of this cache.
+
+        Sequences join a decode batch by being prefilled one at a time into
+        their own row; only decode runs the batch wide.
+        """
+        if not 0 <= row < self.batch:
+            raise ValueError(f"slot {row} outside cache batch {self.batch}.")
+        prev = self.slot
+        self.slot = row
+        try:
+            yield self
+        finally:
+            self.slot = prev
+
+    def rows(self) -> slice:
+        return slice(None) if self.slot is None else slice(self.slot, self.slot + 1)
+
+    def past(self) -> int:
+        """Tokens already cached, for the position ids of a prefill chunk."""
+        if self.slot is not None:
+            return self.seen[self.slot]
+        first = self.seen[0]
+        if any(n != first for n in self.seen):
+            raise RuntimeError(
+                f"Ragged cache lengths {self.seen} need a prefill slot; "
+                "prefill one sequence at a time."
+            )
+        return first
+
+    def advance(self, n: int, width: int | None = None) -> None:
+        """Bump the length of the rows this forward wrote.
+
+        ``width`` is the batch the forward actually ran; rows beyond it are
+        untouched, so a cache wider than the live batch does not drift.
+        """
+        if self.slot is not None:
+            self.seen[self.slot] += n
+            self.seqlen[self.slot] = self.seen[self.slot]
+            return
+        w = self.batch if width is None else width
+        for b in range(w):
+            self.seen[b] += n
+        # In place on a view, so a captured decode graph keeps working.
+        self.seqlen[:w].add_(n)
 
     def snapshot(self) -> dict:
         """CPU-side handle plus cloned K/V; used to restore after graph warmup."""
         return {
             "seqlen": self.seqlen.clone(),
-            "seen": self.seen,
+            "seen": list(self.seen),
             "k": [t.clone() for t in self.k],
             "v": [t.clone() for t in self.v],
         }
 
     def restore(self, snap: dict) -> None:
         self.seqlen.copy_(snap["seqlen"])
-        self.seen = snap["seen"]
+        self.seen = list(snap["seen"])
         for dst, src in zip(self.k, snap["k"], strict=True):
             dst.copy_(src)
         for dst, src in zip(self.v, snap["v"], strict=True):
             dst.copy_(src)
 
     def update(self, layer_idx: int, key_states: torch.Tensor, value_states: torch.Tensor):
-        start = self.seen
+        start = self.past()
         end = start + key_states.shape[2]
         if end > self.max_len:
             raise RuntimeError(
                 f"KV cache overflow: need {end} slots, max_len={self.max_len}."
             )
-        self.k[layer_idx][:, :, start:end].copy_(key_states)
-        self.v[layer_idx][:, :, start:end].copy_(value_states)
-        k_all = self.k[layer_idx][:, :, :end]
-        v_all = self.v[layer_idx][:, :, :end]
+        rows = self.rows()
+        self.k[layer_idx][rows, :, start:end].copy_(key_states)
+        self.v[layer_idx][rows, :, start:end].copy_(value_states)
+        k_all = self.k[layer_idx][rows, :, :end]
+        v_all = self.v[layer_idx][rows, :, :end]
         if self.layer_types[layer_idx] == "sliding_attention":
             k_all = k_all[:, :, -self.window :]
             v_all = v_all[:, :, -self.window :]
@@ -231,21 +289,29 @@ class MapleAttention:
         bsz, q_len, _ = hidden_states.shape
         qkv = self.qkv_proj(hidden_states, rms_weight=rms_weight, rms_eps=rms_eps)
 
+        # Decode: any batch width. Rows are independent sequences at their own
+        # ``cache.seqlen[b]``, and qkv_proj/o_proj above and below take the
+        # batched GEMM path, so the weights are read once for the whole batch.
         if (
             q_len == 1
-            and bsz == 1
             and cache is not None
+            and cache.slot is None
             and self.use_qk_norm
         ):
+            # Views, not copies: a cache wider than the live batch still hands
+            # the kernels the same base pointers, so this stays graph-safe.
+            k_cache = cache.k[self.layer_idx][:bsz]
+            v_cache = cache.v[self.layer_idx][:bsz]
+            seqlen = cache.seqlen[:bsz]
             q = apply_qkv_decode(
-                qkv.reshape(1, -1),
+                qkv.reshape(bsz, -1),
                 self.q_norm.weight,
                 self.k_norm.weight,
                 cos,
                 sin,
-                cache.k[self.layer_idx],
-                cache.v[self.layer_idx],
-                cache.seqlen,
+                k_cache,
+                v_cache,
+                seqlen,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
@@ -256,9 +322,9 @@ class MapleAttention:
             )
             attn = decode_gqa_attn(
                 q,
-                cache.k[self.layer_idx],
-                cache.v[self.layer_idx],
-                cache.seqlen,
+                k_cache,
+                v_cache,
+                seqlen,
                 scale=self.scale,
                 window=self.sliding_window,
                 workspace=cache.attn_ws,
@@ -714,9 +780,10 @@ class MapleForCausalLM:
                 seq_len, device=input_ids.device, dtype=torch.long
             ).unsqueeze(0).expand(bsz, -1)
         elif seq_len == 1:
-            position_ids = cache.seqlen.view(1, 1).expand(bsz, 1)
+            # One position per row: rows sit at different lengths.
+            position_ids = cache.seqlen[cache.rows()][:bsz].view(bsz, 1)
         else:
-            past = cache.seen
+            past = cache.past()
             position_ids = torch.arange(
                 past, past + seq_len, device=input_ids.device, dtype=torch.long
             ).unsqueeze(0).expand(bsz, -1)
@@ -725,11 +792,7 @@ class MapleForCausalLM:
         for layer in self.layers:
             hidden = layer(hidden, position_ids, cos, sin, cache)
         if cache is not None:
-            if seq_len == 1:
-                cache.seqlen.add_(1)
-            else:
-                cache.seen = cache.seen + seq_len
-                cache.seqlen.fill_(cache.seen)
+            cache.advance(seq_len, bsz)
         hidden = self.norm(hidden)
         if logits_to_keep:
             hidden = hidden[:, -logits_to_keep:, :]

@@ -74,11 +74,16 @@ def _qk_norm_rope_store_kernel(
     seqlen_ptr,
     n_q,
     n_kv,
+    stride_xb,
+    stride_cb,
+    stride_qb,
     stride_qh,
     stride_qd,
+    stride_kb,
     stride_kh,
     stride_kt,
     stride_kd,
+    stride_vb,
     stride_vh,
     stride_vt,
     stride_vd,
@@ -87,20 +92,29 @@ def _qk_norm_rope_store_kernel(
     USE_ROPE: tl.constexpr,
     eps,
 ):
+    """One program per (head slot, batch row).
+
+    Each row has its own write position ``seqlen[b]`` and its own RoPE angles,
+    and nothing here is shared across rows, so the batch is a grid dimension.
+    """
     pid = tl.program_id(0)
+    b = tl.program_id(1)
     cols = tl.arange(0, HEAD_DIM)
-    pos = tl.load(seqlen_ptr)
+    pos = tl.load(seqlen_ptr + b)
     q_size = n_q * HEAD_DIM
     kv_size = n_kv * HEAD_DIM
+    row_ptr = qkv_ptr + b * stride_xb
+    cos_b = cos_ptr + b * stride_cb
+    sin_b = sin_ptr + b * stride_cb
 
     if pid < n_q:
         base = pid * HEAD_DIM
         _rms_rope_store_q_k(
-            qkv_ptr + base,
+            row_ptr + base,
             q_w_ptr,
-            cos_ptr,
-            sin_ptr,
-            q_out_ptr + pid * stride_qh,
+            cos_b,
+            sin_b,
+            q_out_ptr + b * stride_qb + pid * stride_qh,
             HEAD_DIM,
             ROTARY_DIM,
             USE_ROPE,
@@ -112,11 +126,11 @@ def _qk_norm_rope_store_kernel(
         kv_h = pid - n_q
         base = q_size + kv_h * HEAD_DIM
         _rms_rope_store_q_k(
-            qkv_ptr + base,
+            row_ptr + base,
             k_w_ptr,
-            cos_ptr,
-            sin_ptr,
-            k_cache_ptr + kv_h * stride_kh + pos * stride_kt,
+            cos_b,
+            sin_b,
+            k_cache_ptr + b * stride_kb + kv_h * stride_kh + pos * stride_kt,
             HEAD_DIM,
             ROTARY_DIM,
             USE_ROPE,
@@ -127,9 +141,13 @@ def _qk_norm_rope_store_kernel(
     else:
         kv_h = pid - n_q - n_kv
         base = q_size + kv_size + kv_h * HEAD_DIM
-        x = tl.load(qkv_ptr + base + cols)
+        x = tl.load(row_ptr + base + cols)
         tl.store(
-            v_cache_ptr + kv_h * stride_vh + pos * stride_vt + cols * stride_vd,
+            v_cache_ptr
+            + b * stride_vb
+            + kv_h * stride_vh
+            + pos * stride_vt
+            + cols * stride_vd,
             x,
         )
 
@@ -145,17 +163,22 @@ def _decode_gqa_kernel(
     seqlen_ptr,
     scale,
     max_len,
+    stride_qb,
     stride_qh,
     stride_qd,
+    stride_kb,
     stride_kh,
     stride_kt,
     stride_kd,
+    stride_vb,
     stride_vh,
     stride_vt,
     stride_vd,
+    stride_ob,
     stride_os,
     stride_oh,
     stride_od,
+    stride_mb,
     stride_ms,
     stride_mh,
     HEAD_DIM: tl.constexpr,
@@ -166,26 +189,34 @@ def _decode_gqa_kernel(
     SPLITS: tl.constexpr,
     IEEE: tl.constexpr,
 ):
-    """One program per (KV head, sequence split).
+    """One program per (KV head, sequence split, batch row).
 
     All ``GROUP`` query heads sharing a KV head are scored against the same K/V
     tile, so the cache is read once instead of once per query head. With
     ``SPLITS > 1`` each program covers a slice of the sequence and writes
     ``(acc, m, l)`` partials for ``_gqa_combine_kernel`` to merge.
+
+    Batch rows have independent K/V and independent ``seqlen[b]``, so unlike
+    the GEMV kernels there is no tile to amortise across the batch: the row is
+    a grid dimension, which is also what keeps the ragged lengths free.
     """
     kv_h = tl.program_id(0)
     sp = tl.program_id(1)
+    b = tl.program_id(2)
     offs_d = tl.arange(0, HEAD_DIM)
     offs_g = tl.arange(0, BLOCK_G)
     mask_g = offs_g < GROUP
 
     q = tl.load(
-        q_ptr + (kv_h * GROUP + offs_g)[:, None] * stride_qh + offs_d[None, :] * stride_qd,
+        q_ptr
+        + b * stride_qb
+        + (kv_h * GROUP + offs_g)[:, None] * stride_qh
+        + offs_d[None, :] * stride_qd,
         mask=mask_g[:, None],
         other=0.0,
     )
 
-    kv_len = tl.minimum(tl.load(seqlen_ptr) + 1, max_len)
+    kv_len = tl.minimum(tl.load(seqlen_ptr + b) + 1, max_len)
     start = 0
     if WINDOW > 0:
         start = tl.maximum(0, kv_len - WINDOW)
@@ -201,8 +232,8 @@ def _decode_gqa_kernel(
     l_i = tl.zeros((BLOCK_G,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_G, HEAD_DIM), dtype=tl.float32)
 
-    k_row = k_ptr + kv_h * stride_kh
-    v_row = v_ptr + kv_h * stride_vh
+    k_row = k_ptr + b * stride_kb + kv_h * stride_kh
+    v_row = v_ptr + b * stride_vb + kv_h * stride_vh
 
     for t0 in range(lo_aligned, hi, BLOCK_T):
         offs_t = t0 + tl.arange(0, BLOCK_T)
@@ -242,7 +273,9 @@ def _decode_gqa_kernel(
 
     if SPLITS == 1:
         tl.store(
-            out_ptr + (kv_h * GROUP + offs_g)[:, None] * stride_oh
+            out_ptr
+            + b * stride_ob
+            + (kv_h * GROUP + offs_g)[:, None] * stride_oh
             + offs_d[None, :] * stride_od,
             acc / l_i[:, None],
             mask=mask_g[:, None],
@@ -250,13 +283,14 @@ def _decode_gqa_kernel(
     else:
         tl.store(
             out_ptr
+            + b * stride_ob
             + sp * stride_os
             + (kv_h * GROUP + offs_g)[:, None] * stride_oh
             + offs_d[None, :] * stride_od,
             acc,
             mask=mask_g[:, None],
         )
-        base = sp * stride_ms + (kv_h * GROUP + offs_g) * stride_mh
+        base = b * stride_mb + sp * stride_ms + (kv_h * GROUP + offs_g) * stride_mh
         tl.store(m_ptr + base, m_i, mask=mask_g)
         tl.store(l_ptr + base, l_i, mask=mask_g)
 
@@ -267,34 +301,44 @@ def _gqa_combine_kernel(
     m_ptr,
     l_ptr,
     out_ptr,
+    stride_pb,
     stride_ps,
     stride_ph,
     stride_pd,
+    stride_mb,
     stride_ms,
     stride_mh,
+    stride_ob,
     stride_oh,
     stride_od,
     HEAD_DIM: tl.constexpr,
     SPLITS: tl.constexpr,
 ):
-    """Merge per-split ``(acc, m, l)`` partials for one query head."""
+    """Merge per-split ``(acc, m, l)`` partials for one (query head, row)."""
     h = tl.program_id(0)
+    b = tl.program_id(1)
     offs_d = tl.arange(0, HEAD_DIM)
     offs_s = tl.arange(0, SPLITS)
 
-    m = tl.load(m_ptr + offs_s * stride_ms + h * stride_mh)
-    l = tl.load(l_ptr + offs_s * stride_ms + h * stride_mh)
+    m_base = m_ptr + b * stride_mb + offs_s * stride_ms + h * stride_mh
+    l_base = l_ptr + b * stride_mb + offs_s * stride_ms + h * stride_mh
+    m = tl.load(m_base)
+    l = tl.load(l_base)
     # Empty splits carry l == 0; drop them so they cannot move the max.
     m = tl.where(l > 0.0, m, -1.0e9)
     m_max = tl.max(m, axis=0)
     w = tl.where(l > 0.0, tl.exp(m - m_max), 0.0)
 
     part = tl.load(
-        part_ptr + offs_s[:, None] * stride_ps + h * stride_ph + offs_d[None, :] * stride_pd
+        part_ptr
+        + b * stride_pb
+        + offs_s[:, None] * stride_ps
+        + h * stride_ph
+        + offs_d[None, :] * stride_pd
     ).to(tl.float32)
     acc = tl.sum(part * w[:, None], axis=0)
     denom = tl.sum(l * w, axis=0)
-    tl.store(out_ptr + h * stride_oh + offs_d * stride_od, acc / denom)
+    tl.store(out_ptr + b * stride_ob + h * stride_oh + offs_d * stride_od, acc / denom)
 
 
 def apply_qkv_decode(
@@ -315,35 +359,54 @@ def apply_qkv_decode(
     use_qk_norm: bool,
     eps: float,
 ) -> torch.Tensor:
-    """QK RMSNorm + optional RoPE + store K/V at ``seqlen``. Returns Q ``[1, H, 1, D]``."""
-    if qkv.ndim != 2 or qkv.shape[0] != 1:
-        raise ValueError(f"apply_qkv_decode expects [1, qkv], got {tuple(qkv.shape)}.")
+    """QK RMSNorm + optional RoPE + store K/V at ``seqlen``. Returns Q ``[B, H, 1, D]``.
+
+    ``qkv`` is ``[B, qkv_dim]``, ``k_cache``/``v_cache`` are ``[B, n_kv, T, D]``
+    and ``seqlen`` is one write index per row, so rows at different lengths can
+    decode in the same launch.
+    """
+    if qkv.ndim != 2:
+        raise ValueError(f"apply_qkv_decode expects [B, qkv], got {tuple(qkv.shape)}.")
     if not use_qk_norm:
         raise ValueError("apply_qkv_decode requires QK RMSNorm.")
-    q_out = torch.empty(1, num_heads, 1, head_dim, device=qkv.device, dtype=qkv.dtype)
-    k_c = k_cache[0]
-    v_c = v_cache[0]
-    q2 = q_out[0, :, 0, :]
-    _qk_norm_rope_store_kernel[(num_heads + 2 * num_kv_heads,)](
-        qkv.reshape(-1),
+    bsz = qkv.shape[0]
+    if k_cache.shape[0] != bsz or v_cache.shape[0] != bsz:
+        raise ValueError(
+            f"KV cache batch {k_cache.shape[0]} != qkv batch {bsz}."
+        )
+    if seqlen.numel() != bsz:
+        raise ValueError(f"seqlen has {seqlen.numel()} entries, expected {bsz}.")
+    if qkv.stride(1) != 1:
+        raise ValueError("apply_qkv_decode needs a row-contiguous qkv.")
+    q_out = torch.empty(bsz, num_heads, 1, head_dim, device=qkv.device, dtype=qkv.dtype)
+    q3 = q_out[:, :, 0, :]
+    cos_2 = cos.reshape(bsz, -1)
+    sin_2 = sin.reshape(bsz, -1)
+    _qk_norm_rope_store_kernel[(num_heads + 2 * num_kv_heads, bsz)](
+        qkv,
         q_weight.reshape(-1),
         k_weight.reshape(-1),
-        cos.reshape(-1),
-        sin.reshape(-1),
-        q2,
-        k_c,
-        v_c,
-        seqlen,
+        cos_2,
+        sin_2,
+        q3,
+        k_cache,
+        v_cache,
+        seqlen.reshape(-1),
         num_heads,
         num_kv_heads,
-        q2.stride(0),
-        q2.stride(1),
-        k_c.stride(0),
-        k_c.stride(1),
-        k_c.stride(2),
-        v_c.stride(0),
-        v_c.stride(1),
-        v_c.stride(2),
+        qkv.stride(0),
+        cos_2.stride(0),
+        q3.stride(0),
+        q3.stride(1),
+        q3.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        k_cache.stride(3),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        v_cache.stride(3),
         HEAD_DIM=head_dim,
         ROTARY_DIM=max(rotary_dim, 1),
         USE_ROPE=use_rope,
@@ -390,59 +453,80 @@ def decode_gqa_attn(
     window: int | None,
     workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """GQA attention for ``q_len=1``. ``seqlen`` is the index just written (kv_len-1).
+    """GQA attention for ``q_len=1``. ``seqlen[b]`` is the index just written (kv_len-1).
+
+    ``q`` is ``[B, H, 1, D]`` and the caches are ``[B, n_kv, T, D]``; each row
+    walks only its own live range, so a batch of sequences at different lengths
+    costs no more than the longest one.
 
     ``workspace`` holds the per-split ``(acc, m, l)`` partials; pass a
     preallocated one so decode does not allocate inside a CUDA graph.
     """
-    if q.ndim != 4 or q.shape[0] != 1 or q.shape[2] != 1:
-        raise ValueError(f"decode_gqa_attn expects q [1, H, 1, D], got {tuple(q.shape)}.")
-    _, n_q, _, head_dim = q.shape
+    if q.ndim != 4 or q.shape[2] != 1:
+        raise ValueError(f"decode_gqa_attn expects q [B, H, 1, D], got {tuple(q.shape)}.")
+    bsz, n_q, _, head_dim = q.shape
+    if k_cache.shape[0] != bsz or v_cache.shape[0] != bsz:
+        raise ValueError(f"KV cache batch {k_cache.shape[0]} != q batch {bsz}.")
+    if seqlen.numel() != bsz:
+        raise ValueError(f"seqlen has {seqlen.numel()} entries, expected {bsz}.")
     n_kv = k_cache.shape[1]
     max_len = k_cache.shape[2]
     if n_q % n_kv != 0:
         raise ValueError(f"n_q={n_q} not divisible by n_kv={n_kv}.")
     group = n_q // n_kv
     out = torch.empty_like(q)
-    q2 = q[0, :, 0, :]
-    o2 = out[0, :, 0, :]
+    q3 = q[:, :, 0, :]
+    o3 = out[:, :, 0, :]
     win = 0 if window is None else int(window)
     splits = gqa_splits(max_len, window)
 
     if splits == 1:
-        part, m_buf, l_buf = o2, o2, o2
-        stride_os = stride_ms = 0
+        part, m_buf, l_buf = o3, o3, o3
+        stride_ob = o3.stride(0)
+        stride_os = stride_mb = stride_ms = 0
     else:
         if workspace is None:
-            part = torch.empty(splits, n_q, head_dim, device=q.device, dtype=torch.float32)
-            m_buf = torch.empty(splits, n_q, device=q.device, dtype=torch.float32)
-            l_buf = torch.empty(splits, n_q, device=q.device, dtype=torch.float32)
+            part = torch.empty(
+                bsz, splits, n_q, head_dim, device=q.device, dtype=torch.float32
+            )
+            m_buf = torch.empty(bsz, splits, n_q, device=q.device, dtype=torch.float32)
+            l_buf = torch.empty(bsz, splits, n_q, device=q.device, dtype=torch.float32)
         else:
             part, m_buf, l_buf = workspace
-        stride_os = part.stride(0)
-        stride_ms = m_buf.stride(0)
+            part = part[:bsz]
+            m_buf = m_buf[:bsz]
+            l_buf = l_buf[:bsz]
+        stride_ob = part.stride(0)
+        stride_os = part.stride(1)
+        stride_mb = m_buf.stride(0)
+        stride_ms = m_buf.stride(1)
 
-    _decode_gqa_kernel[(n_kv, splits)](
-        q2,
-        k_cache[0],
-        v_cache[0],
+    _decode_gqa_kernel[(n_kv, splits, bsz)](
+        q3,
+        k_cache,
+        v_cache,
         part,
         m_buf,
         l_buf,
-        seqlen,
+        seqlen.reshape(-1),
         float(scale),
         max_len,
-        q2.stride(0),
-        q2.stride(1),
-        k_cache[0].stride(0),
-        k_cache[0].stride(1),
-        k_cache[0].stride(2),
-        v_cache[0].stride(0),
-        v_cache[0].stride(1),
-        v_cache[0].stride(2),
+        q3.stride(0),
+        q3.stride(1),
+        q3.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        k_cache.stride(3),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        v_cache.stride(3),
+        stride_ob,
         stride_os,
         part.stride(-2),
         part.stride(-1),
+        stride_mb,
         stride_ms,
         m_buf.stride(-1),
         HEAD_DIM=head_dim,
@@ -456,18 +540,21 @@ def decode_gqa_attn(
         num_stages=2,
     )
     if splits > 1:
-        _gqa_combine_kernel[(n_q,)](
+        _gqa_combine_kernel[(n_q, bsz)](
             part,
             m_buf,
             l_buf,
-            o2,
+            o3,
             part.stride(0),
             part.stride(1),
             part.stride(2),
+            part.stride(3),
             m_buf.stride(0),
             m_buf.stride(1),
-            o2.stride(0),
-            o2.stride(1),
+            m_buf.stride(2),
+            o3.stride(0),
+            o3.stride(1),
+            o3.stride(2),
             HEAD_DIM=head_dim,
             SPLITS=splits,
             num_warps=4,

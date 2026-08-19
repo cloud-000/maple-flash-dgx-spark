@@ -297,3 +297,90 @@ def test_from_packed_rejects_unpacked_config(tmp_path: Path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "maple"}))
     with pytest.raises(ValueError, match="packed-ternary-v1"):
         MapleForCausalLM.from_packed(str(tmp_path))
+
+
+def _tiny_batch_model(seed: int = 11):
+    from maple_run.model import MapleForCausalLM
+
+    cfg = _tiny_config(num_hidden_layers=2, layer_types=["sliding_attention", "full_attention"])
+    rng = np.random.default_rng(seed)
+    return MapleForCausalLM.from_weight_dict(cfg, _tiny_weights(cfg, rng), device="cuda"), cfg
+
+
+@cuda
+def test_kv_cache_prefill_slots_keep_rows_independent():
+    """Prefilling row by row must leave each row at its own length."""
+    model, cfg = _tiny_batch_model()
+    lens = [3, 7, 5]
+    cache = model.make_cache(max_len=32, batch=len(lens))
+    with torch.inference_mode():
+        for b, n in enumerate(lens):
+            ids = torch.randint(0, cfg["vocab_size"], (1, n), device="cuda")
+            with cache.prefill_slot(b):
+                model.forward(ids, cache=cache, logits_to_keep=1)
+    assert cache.seen == lens
+    assert cache.seqlen.tolist() == lens
+    # One decode step advances every row by one.
+    with torch.inference_mode():
+        nxt = torch.randint(0, cfg["vocab_size"], (len(lens), 1), device="cuda")
+        model.forward(nxt, cache=cache, logits_to_keep=1)
+    assert cache.seqlen.tolist() == [n + 1 for n in lens]
+
+
+@cuda
+def test_batched_decode_row_is_independent_of_companions():
+    """A row's decode must not depend on which rows share its batch."""
+    from maple_run.generate import batched_generate
+
+    model, cfg = _tiny_batch_model()
+    torch.manual_seed(3)
+    prompts = [
+        torch.randint(0, cfg["vocab_size"], (n,), device="cuda") for n in (4, 9, 6, 12)
+    ]
+    together = batched_generate(model, prompts, max_tokens=8, stop_ids=set()).token_ids
+    for b, p in enumerate(prompts):
+        # Paired only with a copy of itself: still the batched kernels, but no
+        # other sequence in the batch.
+        alone = batched_generate(model, [p, p], max_tokens=8, stop_ids=set()).token_ids
+        assert alone[0] == alone[1]
+        assert together[b] == alone[0], f"row {b} changed with its companions"
+
+
+@cuda
+def test_batched_decode_respects_per_row_stop():
+    from maple_run.generate import batched_generate
+
+    model, cfg = _tiny_batch_model(seed=21)
+    torch.manual_seed(5)
+    prompts = [
+        torch.randint(0, cfg["vocab_size"], (n,), device="cuda") for n in (4, 6, 5)
+    ]
+    free = batched_generate(model, prompts, max_tokens=10, stop_ids=set())
+    stop = {free.token_ids[1][2]}
+    got = batched_generate(model, prompts, max_tokens=10, stop_ids=stop)
+    assert got.token_ids[1] == free.token_ids[1][:3]
+    assert got.finish_reasons[1] == "stop"
+    # Rows that never emit the stop id run to length and are unaffected.
+    for b in (0, 2):
+        if stop.isdisjoint(free.token_ids[b]):
+            assert got.token_ids[b] == free.token_ids[b]
+            assert got.finish_reasons[b] == "length"
+
+
+@cuda
+def test_batched_generate_prompt_lengths_and_shapes():
+    from maple_run.generate import batched_generate
+
+    model, cfg = _tiny_batch_model()
+    torch.manual_seed(1)
+    # A 1-token prompt is the awkward case: its prefill is q_len == 1, which
+    # must still go down the slotted SDPA path and not the decode fast path.
+    prompts = [
+        torch.randint(0, cfg["vocab_size"], (n,), device="cuda") for n in (1, 11, 5)
+    ]
+    r = batched_generate(model, prompts, max_tokens=6, stop_ids=set())
+    assert r.prompt_lens == [1, 11, 5]
+    assert [len(t) for t in r.token_ids] == [6, 6, 6]
+    assert r.n_new == 18
+    assert r.steps == 5
+    assert r.decode_tok_s > 0

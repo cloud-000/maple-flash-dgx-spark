@@ -678,6 +678,111 @@ def log_model_traffic(model, flash_head: bool = False, log: Callable[[str], None
         )
 
 
+@dataclass
+class BatchedResult:
+    """Per-row token ids plus the timings for an aggregate tok/s."""
+
+    token_ids: list[list[int]]
+    prompt_lens: list[int]
+    finish_reasons: list[str]
+    prefill_s: float
+    decode_s: float
+    steps: int
+
+    @property
+    def n_new(self) -> int:
+        return sum(len(t) for t in self.token_ids)
+
+    @property
+    def decode_tok_s(self) -> float:
+        """Aggregate: every row's tokens over the shared wall clock."""
+        return self.n_new / self.decode_s if self.decode_s > 0 else 0.0
+
+
+@torch.inference_mode()
+def batched_generate(
+    model,
+    prompts,
+    *,
+    max_tokens: int = 128,
+    stop_ids: set[int] | None = None,
+    cache=None,
+) -> BatchedResult:
+    """Greedy eager decode of several sequences in one batch.
+
+    Deliberately the simplest thing that runs the batch: argmax per row, no
+    CUDA graphs and no fused sampler, so a step is exactly one eager
+    ``forward``. Prefill stays batch-1 -- each prompt is run into its own cache
+    row via :meth:`KVCache.prefill_slot` -- and only decode goes wide, which is
+    where the packed weights get read once for the whole batch instead of once
+    per row.
+
+    Rows keep their own length, so prompts of different sizes batch together;
+    a row that hits a stop id stops recording while the rest keep stepping.
+    """
+    device = model.device
+    rows = [
+        torch.as_tensor(p, device=device, dtype=torch.long).reshape(-1)
+        for p in prompts
+    ]
+    if not rows:
+        raise ValueError("batched_generate needs at least one prompt.")
+    bsz = len(rows)
+    prompt_lens = [int(t.numel()) for t in rows]
+    if stop_ids is None:
+        stop_ids = stop_token_ids(model)
+    if cache is None:
+        cache = model.make_cache(
+            max_len=max(prompt_lens) + max(int(max_tokens), 1), batch=bsz
+        )
+    elif cache.batch < bsz:
+        raise ValueError(f"cache batch {cache.batch} < {bsz} prompts.")
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    next_ids = torch.zeros(bsz, 1, dtype=torch.long, device=device)
+    for b, row in enumerate(rows):
+        with cache.prefill_slot(b):
+            logits = model.forward(row.view(1, -1), cache=cache, logits_to_keep=1)
+        next_ids[b, 0] = logits[0, -1].argmax()
+    torch.cuda.synchronize()
+    prefill_s = time.perf_counter() - t0
+
+    out: list[list[int]] = [[] for _ in range(bsz)]
+    reasons = ["length"] * bsz
+    done = [False] * bsz
+    steps = 0
+    t0 = time.perf_counter()
+    for step in range(int(max_tokens)):
+        picked = next_ids[:, 0].tolist()
+        for b in range(bsz):
+            if done[b]:
+                continue
+            out[b].append(picked[b])
+            if picked[b] in stop_ids:
+                done[b] = True
+                reasons[b] = "stop"
+        if all(done) or step + 1 >= int(max_tokens):
+            break
+        # Finished rows keep stepping: they cost nothing extra (the weights are
+        # already being read for the live rows) and dropping them mid-run would
+        # change every other row's kernel shapes.
+        logits = model.forward(next_ids, cache=cache, logits_to_keep=1)
+        next_ids = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        steps += 1
+    torch.cuda.synchronize()
+    decode_s = time.perf_counter() - t0
+
+    return BatchedResult(
+        token_ids=out,
+        prompt_lens=prompt_lens,
+        finish_reasons=reasons,
+        prefill_s=prefill_s,
+        decode_s=decode_s,
+        steps=steps,
+    )
+
+
 def run_generate(
     model,
     tokenizer,
