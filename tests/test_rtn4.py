@@ -134,3 +134,80 @@ def test_rtn4_gemv_rejects_dense_weight():
     scales = torch.ones(16, 2, device="cuda")
     with pytest.raises(TypeError, match="uint32"):
         rtn4_gemv(x, fake, scales, scales)
+
+
+def _rtn4_fixture(n_out, k_in, seed):
+    rng = np.random.default_rng(seed)
+    weight = rng.standard_normal((n_out, k_in)).astype(np.float32)
+    packed, scales, biases = quantize_rtn(weight)
+    return (
+        torch.from_numpy(np.ascontiguousarray(packed)).cuda().to(torch.uint32),
+        torch.from_numpy(np.ascontiguousarray(scales)).cuda(),
+        torch.from_numpy(np.ascontiguousarray(biases)).cuda(),
+        torch.from_numpy(dequantize_rtn(packed, scales, biases)).cuda(),
+    )
+
+
+@cuda
+@pytest.mark.parametrize("batch", [2, 3, 8, 16, 17, 32])
+def test_rtn4_batched_matches_batch1_rows(batch):
+    """batch>1 takes _rtn4_gemm_kernel and must match the batch-1 kernel.
+
+    It keeps the affine dequant factored -- s*dot(q,x) + b*sum(x) -- so only the
+    raw 4-bit codes reach the tensor core, and those are exact in bfloat16.
+    """
+    from maple_run.kernels.rtn4 import rtn4_gemv
+
+    packed_t, scales_t, biases_t, _ = _rtn4_fixture(512, 2048, 21)
+    x = torch.randn(batch, 2048, device="cuda", dtype=torch.bfloat16)
+
+    y = rtn4_gemv(x, packed_t, scales_t, biases_t)
+    y_ref = torch.cat(
+        [rtn4_gemv(x[i : i + 1], packed_t, scales_t, biases_t) for i in range(batch)]
+    )
+    assert y.shape == (batch, 512)
+    torch.testing.assert_close(y, y_ref, rtol=8e-3, atol=8e-3)
+
+
+@cuda
+@pytest.mark.parametrize("batch", [2, 8, 32])
+def test_rtn4_batched_matches_dequantized_linear(batch):
+    from maple_run.kernels.rtn4 import rtn4_gemv
+
+    packed_t, scales_t, biases_t, recon = _rtn4_fixture(256, 1024, 22)
+    x = torch.randn(batch, 1024, device="cuda", dtype=torch.bfloat16)
+    y = rtn4_gemv(x, packed_t, scales_t, biases_t).float()
+    torch.testing.assert_close(y, x.float() @ recon.float().T, rtol=1e-2, atol=2e-2)
+
+
+@cuda
+@pytest.mark.parametrize("batch", [2, 8])
+def test_rtn4_batched_packed_kn_matches_nk(batch):
+    from maple_run.kernels.rtn4 import rtn4_gemv
+
+    packed_t, scales_t, biases_t, _ = _rtn4_fixture(128, 512, 23)
+    x = torch.randn(batch, 512, device="cuda", dtype=torch.bfloat16)
+    y_nk = rtn4_gemv(x, packed_t, scales_t, biases_t)
+    y_kn = rtn4_gemv(
+        x,
+        packed_t.t().contiguous(),
+        scales_t.t().contiguous(),
+        biases_t.t().contiguous(),
+        packed_kn=True,
+    )
+    torch.testing.assert_close(y_kn, y_nk, rtol=8e-3, atol=8e-3)
+
+
+@cuda
+@pytest.mark.parametrize("batch", [2, 8])
+def test_rtn4_batched_fp32_matches_dequantized_linear(batch):
+    """float32 activations keep an ieee dot rather than dropping to tf32."""
+    from maple_run.kernels.rtn4 import rtn4_gemv
+
+    rng = np.random.default_rng(24)
+    packed_t, scales_t, biases_t, recon = _rtn4_fixture(128, 512, 24)
+    x = torch.from_numpy(rng.standard_normal((batch, 512)).astype(np.float32)).cuda()
+    y = rtn4_gemv(x, packed_t, scales_t, biases_t)
+    torch.testing.assert_close(
+        y, torch.nn.functional.linear(x, recon), rtol=1e-4, atol=1e-4
+    )

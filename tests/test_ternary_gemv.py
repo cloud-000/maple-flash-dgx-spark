@@ -217,3 +217,112 @@ def test_packed_kn_matches_nk_layout():
     y_nk = ternary_gemv(x, packed_t, alpha_t)
     y_kn = ternary_gemv(x, packed_t.t().contiguous(), alpha_t, packed_kn=True)
     torch.testing.assert_close(y_kn, y_nk, rtol=1e-4, atol=1e-4)
+
+
+def _batch1_rows(fn, x, *args, **kwargs):
+    """Reference: the batch-1 kernel run once per row, stacked."""
+    return torch.cat([fn(x[i : i + 1], *args, **kwargs) for i in range(x.shape[0])])
+
+
+@cuda
+@pytest.mark.parametrize("batch", [2, 3, 8, 16, 17, 32])
+def test_batched_matches_batch1_rows(batch):
+    """batch>1 takes _ternary_gemm_kernel; it must be the batch-1 kernel's answer.
+
+    Both accumulate in float32 over the same exactly-representable products, so
+    they differ only in summation order -- well inside one bfloat16 ulp of the
+    shared output dtype.
+    """
+    from maple_run.kernels.ternary_gemv import ternary_gemv
+
+    rng = np.random.default_rng(11)
+    weight = rng.standard_normal((512, 2048)).astype(np.float32)
+    packed, alpha = ternarize(weight)
+    packed_t, alpha_t = _to_cuda_packed(packed, alpha)
+    x = torch.randn(batch, 2048, device="cuda", dtype=torch.bfloat16)
+
+    y = ternary_gemv(x, packed_t, alpha_t)
+    y_ref = _batch1_rows(ternary_gemv, x, packed_t, alpha_t)
+    assert y.shape == (batch, 512)
+    torch.testing.assert_close(y, y_ref, rtol=8e-3, atol=8e-3)
+
+
+@cuda
+@pytest.mark.parametrize("batch", [2, 8, 32])
+def test_batched_fused_rmsnorm_matches_batch1_rows(batch):
+    """The folded RMSNorm keeps float32 precision across the batched dot.
+
+    x*rms_w is a float32 product; feeding only its bfloat16 head to the tensor
+    core would drop ~8 mantissa bits, so the kernel also dots the residual.
+    """
+    from maple_run.kernels.ternary_gemv import ternary_gemv
+
+    rng = np.random.default_rng(12)
+    weight = rng.standard_normal((512, 2048)).astype(np.float32)
+    packed, alpha = ternarize(weight)
+    packed_t, alpha_t = _to_cuda_packed(packed, alpha)
+    x = torch.randn(batch, 2048, device="cuda", dtype=torch.bfloat16)
+    rms_w = torch.rand(2048, device="cuda", dtype=torch.float32) + 0.5
+
+    y = ternary_gemv(x, packed_t, alpha_t, rms_weight=rms_w)
+    y_ref = _batch1_rows(ternary_gemv, x, packed_t, alpha_t, rms_weight=rms_w)
+    torch.testing.assert_close(y, y_ref, rtol=8e-3, atol=8e-3)
+
+    w_hat = torch.from_numpy(_codes_to_weight(unpack_2bit(packed), alpha)).cuda()
+    xf = x.float()
+    x_norm = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6) * rms_w
+    torch.testing.assert_close(
+        y.float(), x_norm @ w_hat.T, rtol=1e-2, atol=5e-2
+    )
+
+
+@cuda
+@pytest.mark.parametrize("batch", [2, 8])
+def test_batched_fp32_matches_batch1_rows(batch):
+    """float32 activations must not be demoted to tf32 by the batched dot."""
+    from maple_run.kernels.ternary_gemv import ternary_gemv
+
+    rng = np.random.default_rng(13)
+    weight = rng.standard_normal((128, 512)).astype(np.float32)
+    packed, alpha = ternarize(weight)
+    packed_t, alpha_t = _to_cuda_packed(packed, alpha)
+    x = torch.from_numpy(
+        rng.standard_normal((batch, 512)).astype(np.float32)
+    ).cuda()
+
+    y = ternary_gemv(x, packed_t, alpha_t)
+    w_hat = torch.from_numpy(_codes_to_weight(unpack_2bit(packed), alpha)).cuda()
+    torch.testing.assert_close(
+        y, torch.nn.functional.linear(x, w_hat), rtol=1e-4, atol=1e-4
+    )
+
+
+@cuda
+def test_batched_reads_each_code_tile_once_per_cta():
+    """The point of the batched kernel: weight traffic stops scaling with B.
+
+    Batch 32 through the batch-1 kernel re-reads the codes 32 times; through
+    _ternary_gemm_kernel it reads them once per CTA, so wall time must stay far
+    below 32x the batch-1 time on the same weights.
+    """
+    from maple_run.kernels.ternary_gemv import ternary_gemv
+
+    rng = np.random.default_rng(14)
+    packed, alpha = ternarize(rng.standard_normal((3072, 2048)).astype(np.float32))
+    packed_t, alpha_t = _to_cuda_packed(packed, alpha)
+
+    def timed(batch):
+        x = torch.randn(batch, 2048, device="cuda", dtype=torch.bfloat16)
+        for _ in range(5):
+            ternary_gemv(x, packed_t, alpha_t)
+        torch.cuda.synchronize()
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
+        for _ in range(50):
+            ternary_gemv(x, packed_t, alpha_t)
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / 50
+
+    t1, t32 = timed(1), timed(32)
+    assert t32 < 8 * t1, f"batch 32 took {t32/t1:.1f}x batch 1; weights not shared"
