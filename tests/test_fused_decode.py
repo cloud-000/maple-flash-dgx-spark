@@ -359,3 +359,44 @@ def test_batched_decode_attn_ignores_other_rows_cache():
     for b in (0, 2):
         assert torch.equal(out_a[b], out_b[b]), f"row {b} moved with row 1's cache"
     assert not torch.equal(out_a[1], out_b[1])
+
+
+@cuda
+def test_decode_attn_row_map_matches_a_gathered_dense_cache():
+    """``row_map`` must be pure indirection: same result, cache rows untouched."""
+    from maple_run.kernels.decode_attn import apply_qkv_decode, decode_gqa_attn
+
+    lens = [5, 100, 63, 300]
+    bsz, n_q, n_kv, d, rot = len(lens), 8, 2, 64, 32
+    q_w, k_w, qkv, _k, _v, seqlen, cos, sin = _decode_attn_fixture(bsz, lens)
+    # A cache wider than the batch, with the sequences scattered across it.
+    n_rows = 6
+    torch.manual_seed(13)
+    k0 = torch.randn(n_rows, n_kv, 1024, d, device="cuda", dtype=torch.bfloat16)
+    v0 = torch.randn(n_rows, n_kv, 1024, d, device="cuda", dtype=torch.bfloat16)
+    perm = torch.tensor([4, 1, 5, 0], device="cuda", dtype=torch.int32)
+    kw = dict(
+        num_heads=n_q,
+        num_kv_heads=n_kv,
+        head_dim=d,
+        rotary_dim=rot,
+        use_rope=True,
+        use_qk_norm=True,
+        eps=1e-6,
+    )
+
+    ka, va = k0.clone(), v0.clone()
+    q = apply_qkv_decode(qkv, q_w, k_w, cos, sin, ka, va, seqlen, row_map=perm, **kw)
+    out = decode_gqa_attn(q, ka, va, seqlen, row_map=perm, scale=d**-0.5, window=None)
+
+    idx = perm.long()
+    kd, vd = k0[idx].clone(), v0[idx].clone()
+    q_ref = apply_qkv_decode(qkv, q_w, k_w, cos, sin, kd, vd, seqlen, **kw)
+    out_ref = decode_gqa_attn(q_ref, kd, vd, seqlen, scale=d**-0.5, window=None)
+
+    assert torch.equal(q, q_ref)
+    assert torch.equal(out, out_ref)
+    assert torch.equal(ka[idx], kd) and torch.equal(va[idx], vd)
+    untouched = [r for r in range(n_rows) if r not in perm.tolist()]
+    assert torch.equal(ka[untouched], k0[untouched]), "wrote outside the mapped rows"
+    assert torch.equal(va[untouched], v0[untouched]), "wrote outside the mapped rows"

@@ -106,3 +106,79 @@ def test_fused_sampler_rejects_unsupported_settings():
         fused_sample(logits, u, temperature=1.0, top_p=0.95, top_k=0)
     with pytest.raises(ValueError):
         fused_sample(logits, u, temperature=0.0, top_p=0.95, top_k=20)
+
+
+@cuda
+@pytest.mark.parametrize("top_k", [1, 20, 64])
+@pytest.mark.parametrize("top_p", [0.3, 0.95, 1.0])
+def test_batched_sampler_matches_per_row(top_k, top_p):
+    """Row ``b`` must draw exactly what it would have drawn alone.
+
+    The batch is only a grid dimension in these kernels, so the bar is bitwise
+    equality, not distributional agreement.
+    """
+    from maple_run.kernels.sampler import fused_sample, fused_sample_batched
+
+    torch.manual_seed(4)
+    bsz = 9
+    logits = torch.randn(bsz, VOCAB, device="cuda") * 4
+    u = torch.rand(bsz, device="cuda")
+    got = fused_sample_batched(
+        logits, u, temperature=0.8, top_p=top_p, top_k=top_k
+    )
+    want = torch.stack(
+        [
+            fused_sample(
+                logits[b].contiguous(), u[b], temperature=0.8, top_p=top_p, top_k=top_k
+            )
+            for b in range(bsz)
+        ]
+    )
+    assert torch.equal(got, want)
+
+
+@cuda
+def test_batched_sampler_reads_rows_of_a_strided_view():
+    """Callers pass ``logits[:, -1, :]``, which is not contiguous."""
+    from maple_run.kernels.sampler import fused_sample, fused_sample_batched
+
+    torch.manual_seed(6)
+    bsz = 5
+    logits = torch.randn(bsz, 3, VOCAB, device="cuda") * 4
+    u = torch.rand(bsz, device="cuda")
+    got = fused_sample_batched(
+        logits[:, -1, :], u, temperature=1.0, top_p=0.95, top_k=20
+    )
+    want = torch.stack(
+        [
+            fused_sample(
+                logits[b, -1, :].contiguous(),
+                u[b],
+                temperature=1.0,
+                top_p=0.95,
+                top_k=20,
+            )
+            for b in range(bsz)
+        ]
+    )
+    assert torch.equal(got, want)
+
+
+@cuda
+def test_batched_sampler_workspace_is_reused_not_resized():
+    """A narrower replay slices the widest workspace; it must not reallocate."""
+    from maple_run.kernels.sampler import batched_sampler_workspace, fused_sample_batched
+
+    torch.manual_seed(8)
+    ws = batched_sampler_workspace(VOCAB, 20, 8, "cuda")
+    ptrs = [t.data_ptr() for t in ws]
+    logits = torch.randn(8, VOCAB, device="cuda") * 4
+    u = torch.rand(8, device="cuda")
+    wide = fused_sample_batched(
+        logits, u, temperature=1.0, top_p=0.95, top_k=20, workspace=ws
+    ).clone()
+    narrow = fused_sample_batched(
+        logits[:3], u[:3], temperature=1.0, top_p=0.95, top_k=20, workspace=ws
+    )
+    assert [t.data_ptr() for t in ws] == ptrs
+    assert torch.equal(narrow, wide[:3])

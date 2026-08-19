@@ -384,3 +384,98 @@ def test_batched_generate_prompt_lengths_and_shapes():
     assert r.n_new == 18
     assert r.steps == 5
     assert r.decode_tok_s > 0
+
+
+@cuda
+def test_swap_slots_moves_indices_not_kv():
+    model, _cfg = _tiny_batch_model()
+    cache = model.make_cache(max_len=16, batch=3)
+    cache.remap = True
+    cache.k[0][0].fill_(1.0)
+    cache.k[0][1].fill_(2.0)
+    before = [t.clone() for t in cache.k]
+    cache.seen = [4, 7, 2]
+    cache.seqlen.copy_(torch.tensor([4, 7, 2], device="cuda"))
+
+    cache.swap_slots(0, 1)
+    assert cache.row_of == [1, 0, 2]
+    assert cache.row_map.tolist() == [1, 0, 2]
+    assert cache.seen == [7, 4, 2]
+    assert cache.seqlen.tolist() == [7, 4, 2]
+    for a, b in zip(cache.k, before, strict=True):
+        assert torch.equal(a, b), "swap_slots copied K/V"
+
+
+@cuda
+def test_swap_slots_refuses_without_the_row_map():
+    model, _cfg = _tiny_batch_model()
+    cache = model.make_cache(max_len=16, batch=2)
+    with pytest.raises(RuntimeError, match="remap"):
+        cache.swap_slots(0, 1)
+
+
+@cuda
+def test_bucketed_decode_graphs_match_eager_ids():
+    """Graph replay must produce the same ids as eager, at every bucket."""
+    from maple_run.generate import batched_generate
+
+    model, cfg = _tiny_batch_model(seed=31)
+    torch.manual_seed(9)
+    prompts = [
+        torch.randint(0, cfg["vocab_size"], (n,), device="cuda") for n in (4, 9, 6, 12)
+    ]
+    eager = batched_generate(model, prompts, max_tokens=12, stop_ids=set(), log=lambda _m: None)
+    graph = batched_generate(
+        model, prompts, max_tokens=12, stop_ids=set(), graphs=True, log=lambda _m: None
+    )
+    assert graph.token_ids == eager.token_ids
+
+
+@cuda
+def test_bucketed_graphs_narrow_as_rows_finish():
+    """Retiring rows must shrink the replayed bucket, not just idle in it."""
+    from maple_run.generate import batched_generate, decode_buckets
+
+    model, cfg = _tiny_batch_model(seed=31)
+    torch.manual_seed(9)
+    prompts = [
+        torch.randint(0, cfg["vocab_size"], (n,), device="cuda") for n in (4, 9, 6, 12)
+    ]
+    free = batched_generate(model, prompts, max_tokens=12, stop_ids=set(), log=lambda _m: None)
+    # Stop three of the four rows early; the survivor should end up on a
+    # narrower graph than the width-4 one the batch started on.
+    stop = {free.token_ids[b][1] for b in (0, 1, 2)}
+    got = batched_generate(
+        model, prompts, max_tokens=12, stop_ids=stop, graphs=True, log=lambda _m: None
+    )
+    assert decode_buckets(4) == (1, 2, 4)
+    assert [len(t) for t in got.token_ids][:3] == [2, 2, 2]
+    assert got.finish_reasons[:3] == ["stop"] * 3
+    # The surviving row keeps decoding what it decoded alone...
+    n = len(got.token_ids[3])
+    assert got.token_ids[3] == free.token_ids[3][:n]
+    # ...and once the other three retire, every later step replays width 1.
+    assert got.widths[0] == 4
+    assert set(got.widths[1:]) == {1}
+
+
+@cuda
+def test_batched_sampled_decode_gives_each_row_its_own_draw():
+    from maple_run.generate import batched_generate
+
+    model, cfg = _tiny_batch_model(seed=41)
+    torch.manual_seed(2)
+    prompt = torch.randint(0, cfg["vocab_size"], (6,), device="cuda")
+    r = batched_generate(
+        model,
+        [prompt] * 8,
+        max_tokens=16,
+        stop_ids=set(),
+        temperature=1.5,
+        top_p=1.0,
+        top_k=32,
+        seed=17,
+        log=lambda _m: None,
+    )
+    # Identical prompts: identical rows would mean one draw shared by all.
+    assert len({tuple(t) for t in r.token_ids}) > 1

@@ -72,6 +72,7 @@ def _qk_norm_rope_store_kernel(
     k_cache_ptr,
     v_cache_ptr,
     seqlen_ptr,
+    row_map_ptr,
     n_q,
     n_kv,
     stride_xb,
@@ -90,15 +91,25 @@ def _qk_norm_rope_store_kernel(
     HEAD_DIM: tl.constexpr,
     ROTARY_DIM: tl.constexpr,
     USE_ROPE: tl.constexpr,
+    IDENTITY_MAP: tl.constexpr,
     eps,
 ):
     """One program per (head slot, batch row).
 
     Each row has its own write position ``seqlen[b]`` and its own RoPE angles,
     and nothing here is shared across rows, so the batch is a grid dimension.
+
+    ``row_map`` sends batch row ``b`` to the cache row holding its K/V. Live
+    sequences can then be kept in the low batch rows -- which is what lets a
+    decode graph replay at a narrower bucket as rows finish -- by permuting a
+    few integers instead of moving megabytes of cache.
     """
     pid = tl.program_id(0)
     b = tl.program_id(1)
+    if IDENTITY_MAP:
+        cache_b = b
+    else:
+        cache_b = tl.load(row_map_ptr + b)
     cols = tl.arange(0, HEAD_DIM)
     pos = tl.load(seqlen_ptr + b)
     q_size = n_q * HEAD_DIM
@@ -130,7 +141,7 @@ def _qk_norm_rope_store_kernel(
             k_w_ptr,
             cos_b,
             sin_b,
-            k_cache_ptr + b * stride_kb + kv_h * stride_kh + pos * stride_kt,
+            k_cache_ptr + cache_b * stride_kb + kv_h * stride_kh + pos * stride_kt,
             HEAD_DIM,
             ROTARY_DIM,
             USE_ROPE,
@@ -144,7 +155,7 @@ def _qk_norm_rope_store_kernel(
         x = tl.load(row_ptr + base + cols)
         tl.store(
             v_cache_ptr
-            + b * stride_vb
+            + cache_b * stride_vb
             + kv_h * stride_vh
             + pos * stride_vt
             + cols * stride_vd,
@@ -161,6 +172,7 @@ def _decode_gqa_kernel(
     m_ptr,
     l_ptr,
     seqlen_ptr,
+    row_map_ptr,
     scale,
     max_len,
     stride_qb,
@@ -188,6 +200,7 @@ def _decode_gqa_kernel(
     BLOCK_G: tl.constexpr,
     SPLITS: tl.constexpr,
     IEEE: tl.constexpr,
+    IDENTITY_MAP: tl.constexpr,
 ):
     """One program per (KV head, sequence split, batch row).
 
@@ -203,6 +216,11 @@ def _decode_gqa_kernel(
     kv_h = tl.program_id(0)
     sp = tl.program_id(1)
     b = tl.program_id(2)
+    # ``row_map`` is the slot -> cache-row indirection; see the QKV kernel.
+    if IDENTITY_MAP:
+        cache_b = b
+    else:
+        cache_b = tl.load(row_map_ptr + b)
     offs_d = tl.arange(0, HEAD_DIM)
     offs_g = tl.arange(0, BLOCK_G)
     mask_g = offs_g < GROUP
@@ -232,8 +250,8 @@ def _decode_gqa_kernel(
     l_i = tl.zeros((BLOCK_G,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_G, HEAD_DIM), dtype=tl.float32)
 
-    k_row = k_ptr + b * stride_kb + kv_h * stride_kh
-    v_row = v_ptr + b * stride_vb + kv_h * stride_vh
+    k_row = k_ptr + cache_b * stride_kb + kv_h * stride_kh
+    v_row = v_ptr + cache_b * stride_vb + kv_h * stride_vh
 
     for t0 in range(lo_aligned, hi, BLOCK_T):
         offs_t = t0 + tl.arange(0, BLOCK_T)
@@ -351,6 +369,7 @@ def apply_qkv_decode(
     v_cache: torch.Tensor,
     seqlen: torch.Tensor,
     *,
+    row_map: torch.Tensor | None = None,
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
@@ -364,13 +383,16 @@ def apply_qkv_decode(
     ``qkv`` is ``[B, qkv_dim]``, ``k_cache``/``v_cache`` are ``[B, n_kv, T, D]``
     and ``seqlen`` is one write index per row, so rows at different lengths can
     decode in the same launch.
+
+    ``row_map`` optionally sends batch row ``b`` to a different cache row;
+    ``None`` means the identity, and compiles the indirection out.
     """
     if qkv.ndim != 2:
         raise ValueError(f"apply_qkv_decode expects [B, qkv], got {tuple(qkv.shape)}.")
     if not use_qk_norm:
         raise ValueError("apply_qkv_decode requires QK RMSNorm.")
     bsz = qkv.shape[0]
-    if k_cache.shape[0] != bsz or v_cache.shape[0] != bsz:
+    if row_map is None and (k_cache.shape[0] != bsz or v_cache.shape[0] != bsz):
         raise ValueError(
             f"KV cache batch {k_cache.shape[0]} != qkv batch {bsz}."
         )
@@ -392,6 +414,7 @@ def apply_qkv_decode(
         k_cache,
         v_cache,
         seqlen.reshape(-1),
+        q3 if row_map is None else row_map,
         num_heads,
         num_kv_heads,
         qkv.stride(0),
@@ -410,6 +433,7 @@ def apply_qkv_decode(
         HEAD_DIM=head_dim,
         ROTARY_DIM=max(rotary_dim, 1),
         USE_ROPE=use_rope,
+        IDENTITY_MAP=row_map is None,
         eps=float(eps),
     )
     return q_out
@@ -449,6 +473,7 @@ def decode_gqa_attn(
     v_cache: torch.Tensor,
     seqlen: torch.Tensor,
     *,
+    row_map: torch.Tensor | None = None,
     scale: float,
     window: int | None,
     workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
@@ -459,13 +484,16 @@ def decode_gqa_attn(
     walks only its own live range, so a batch of sequences at different lengths
     costs no more than the longest one.
 
+    ``row_map`` optionally sends batch row ``b`` to a different cache row;
+    the split partials stay indexed by batch row either way.
+
     ``workspace`` holds the per-split ``(acc, m, l)`` partials; pass a
     preallocated one so decode does not allocate inside a CUDA graph.
     """
     if q.ndim != 4 or q.shape[2] != 1:
         raise ValueError(f"decode_gqa_attn expects q [B, H, 1, D], got {tuple(q.shape)}.")
     bsz, n_q, _, head_dim = q.shape
-    if k_cache.shape[0] != bsz or v_cache.shape[0] != bsz:
+    if row_map is None and (k_cache.shape[0] != bsz or v_cache.shape[0] != bsz):
         raise ValueError(f"KV cache batch {k_cache.shape[0]} != q batch {bsz}.")
     if seqlen.numel() != bsz:
         raise ValueError(f"seqlen has {seqlen.numel()} entries, expected {bsz}.")
@@ -509,6 +537,7 @@ def decode_gqa_attn(
         m_buf,
         l_buf,
         seqlen.reshape(-1),
+        q3 if row_map is None else row_map,
         float(scale),
         max_len,
         q3.stride(0),
@@ -536,6 +565,7 @@ def decode_gqa_attn(
         BLOCK_G=max(16, triton.next_power_of_2(group)),
         SPLITS=splits,
         IEEE=k_cache.dtype == torch.float32,
+        IDENTITY_MAP=row_map is None,
         num_warps=4,
         num_stages=2,
     )

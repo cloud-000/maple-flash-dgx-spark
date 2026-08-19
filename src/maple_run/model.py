@@ -143,6 +143,15 @@ class KVCache:
         # Row a batch-1 prefill writes into; ``None`` means the whole batch,
         # which is what the eager SDPA path and every B=1 caller want.
         self.slot: int | None = None
+        # Slot -> cache row. Everything else here (seqlen, seen, the attention
+        # workspace) is indexed by slot; only K/V is indexed by cache row. A
+        # scheduler can therefore keep the live sequences in the low slots --
+        # so a decode graph replays at a narrow bucket -- by permuting this
+        # instead of copying cache. ``remap`` stays off until someone asks for
+        # it, which keeps the identity out of the kernels entirely.
+        self.row_of = list(range(batch))
+        self.row_map = torch.arange(batch, dtype=torch.int32, device=device)
+        self.remap = False
         # Split-attention partials, shared by every layer (attention is
         # sequential) and preallocated so decode allocates nothing per step.
         n_heads = n_heads if n_heads is not None else n_kv
@@ -171,8 +180,43 @@ class KVCache:
         finally:
             self.slot = prev
 
-    def rows(self) -> slice:
+    def slot_rows(self) -> slice:
+        """Slots the current forward covers. ``seqlen``/``seen`` are slot-indexed."""
         return slice(None) if self.slot is None else slice(self.slot, self.slot + 1)
+
+    def rows(self) -> slice:
+        """Cache rows the current forward writes."""
+        if self.slot is None:
+            if self.row_of != list(range(self.batch)):
+                raise RuntimeError(
+                    "The whole-batch cache path needs the identity row map; "
+                    "run permuted slots through the fused decode path."
+                )
+            return slice(None)
+        row = self.row_of[self.slot]
+        return slice(row, row + 1)
+
+    def swap_slots(self, i: int, j: int) -> None:
+        """Exchange two slots. Moves indices, never K/V."""
+        if i == j:
+            return
+        if not self.remap:
+            raise RuntimeError(
+                "swap_slots needs cache.remap: without the map the kernels "
+                "read cache row == slot, and a swap would silently read the "
+                "wrong sequence's K/V."
+            )
+        self.row_of[i], self.row_of[j] = self.row_of[j], self.row_of[i]
+        self.row_map[i], self.row_map[j] = self.row_map[j].clone(), self.row_map[i].clone()
+        self.seen[i], self.seen[j] = self.seen[j], self.seen[i]
+        si = self.seqlen[i].clone()
+        self.seqlen[i] = self.seqlen[j]
+        self.seqlen[j] = si
+
+    def reset_slot(self, slot: int) -> None:
+        """Forget a slot's history so a new sequence can take it."""
+        self.seen[slot] = 0
+        self.seqlen[slot] = 0
 
     def past(self) -> int:
         """Tokens already cached, for the position ids of a prefill chunk."""
@@ -201,6 +245,15 @@ class KVCache:
             self.seen[b] += n
         # In place on a view, so a captured decode graph keeps working.
         self.seqlen[:w].add_(n)
+
+    def advance_host(self, n: int, width: int) -> None:
+        """Host-side counterpart of ``advance`` for a graph replay.
+
+        A replay re-runs the device-side ``seqlen`` bump without going through
+        Python, so the host list has to be told separately or the two drift.
+        """
+        for b in range(width):
+            self.seen[b] += n
 
     def snapshot(self) -> dict:
         """CPU-side handle plus cloned K/V; used to restore after graph warmup."""
@@ -300,8 +353,14 @@ class MapleAttention:
         ):
             # Views, not copies: a cache wider than the live batch still hands
             # the kernels the same base pointers, so this stays graph-safe.
-            k_cache = cache.k[self.layer_idx][:bsz]
-            v_cache = cache.v[self.layer_idx][:bsz]
+            # Under a row map the kernels index cache rows themselves, so they
+            # get the whole cache and the map rather than a prefix.
+            row_map = cache.row_map if cache.remap else None
+            k_cache = cache.k[self.layer_idx]
+            v_cache = cache.v[self.layer_idx]
+            if row_map is None:
+                k_cache = k_cache[:bsz]
+                v_cache = v_cache[:bsz]
             seqlen = cache.seqlen[:bsz]
             q = apply_qkv_decode(
                 qkv.reshape(bsz, -1),
@@ -312,6 +371,7 @@ class MapleAttention:
                 k_cache,
                 v_cache,
                 seqlen,
+                row_map=row_map,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
@@ -325,6 +385,7 @@ class MapleAttention:
                 k_cache,
                 v_cache,
                 seqlen,
+                row_map=row_map,
                 scale=self.scale,
                 window=self.sliding_window,
                 workspace=cache.attn_ws,
@@ -781,7 +842,7 @@ class MapleForCausalLM:
             ).unsqueeze(0).expand(bsz, -1)
         elif seq_len == 1:
             # One position per row: rows sit at different lengths.
-            position_ids = cache.seqlen[cache.rows()][:bsz].view(bsz, 1)
+            position_ids = cache.seqlen[cache.slot_rows()][:bsz].view(bsz, 1)
         else:
             past = cache.past()
             position_ids = torch.arange(
