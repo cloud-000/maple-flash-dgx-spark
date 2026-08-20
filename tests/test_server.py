@@ -7,7 +7,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.client import HTTPConnection
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -23,6 +23,7 @@ from maple_run.server import (
     PackedEngine,
     RequestError,
     ServerDefaults,
+    _Server,
     apply_system_prompt,
     chat_completion_response,
     make_handler,
@@ -115,6 +116,15 @@ def test_parse_chat_and_prompt():
     assert parse_completion_prompt({"prompt": ["a", "b"]}) == "ab"
     with pytest.raises(RequestError, match="prompt"):
         parse_completion_prompt({})
+
+
+def test_http_listen_backlog_covers_batched_clients():
+    assert _Server.request_queue_size >= 128
+    httpd = _Server(("127.0.0.1", 0), BaseHTTPRequestHandler, backlog=256)
+    try:
+        assert httpd.request_queue_size == 256
+    finally:
+        httpd.server_close()
 
 
 def test_parse_tools():

@@ -1062,6 +1062,19 @@ def make_handler(engine: PackedEngine):
 class _Server(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+    # stdlib default is 5; a concurrency-32 client RSTs the extras.
+    request_queue_size = 128
+
+    def __init__(
+        self,
+        server_address,
+        RequestHandlerClass,
+        backlog: int | None = None,
+        bind_and_activate: bool = True,
+    ):
+        if backlog is not None:
+            self.request_queue_size = max(int(backlog), 5)
+        super().__init__(server_address, RequestHandlerClass, bind_and_activate)
 
 
 def serve(
@@ -1098,7 +1111,11 @@ def serve(
         log_model_traffic(model, flash_head=flash_head)
         engine = PackedEngine(model, tokenizer, defaults)
         engine.wait_ready()
-    httpd = _Server((host, port), make_handler(engine))
+    httpd = _Server(
+        (host, port),
+        make_handler(engine),
+        backlog=max(128, int(defaults.max_batch) * 4),
+    )
     actual_host, actual_port = httpd.server_address[:2]
     print(
         f"OpenAI-compatible endpoint at http://{actual_host}:{actual_port}/v1 "
