@@ -7,6 +7,15 @@ import sys
 
 from maple_run import __version__
 
+_EVAL_MOVED = (
+    "maple-run eval moved to the bench project.\n"
+    "Serve the packed checkpoint, then run the harness:\n"
+    "  maple-run serve --model checkpoints/maple-2bit --port 8000\n"
+    "  uv run --directory ../bench bench eval "
+    "--base-url http://127.0.0.1:8000/v1 --model maple-2bit "
+    "--output runs/maple-2bit"
+)
+
 
 def _add_sampling_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
@@ -59,6 +68,10 @@ def _validate_sampling_args(parser: argparse.ArgumentParser, args: argparse.Name
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "eval":
+        print(_EVAL_MOVED, file=sys.stderr)
+        return 2
     parser = argparse.ArgumentParser(
         prog="maple-run",
         description="Packed ternary CUDA runtime for DeepGrove Maple-Preview.",
@@ -114,69 +127,16 @@ def main(argv: list[str] | None = None) -> int:
     generate = sub.add_parser("generate", help="Decode from a packed checkpoint")
     generate.add_argument("--model", required=True, help="Packed checkpoint directory")
     generate.add_argument("--prompt", required=True)
+    generate.add_argument(
+        "--eggroll",
+        default=None,
+        help="Directory of saved EGGROLL adapters (disables FlashHead)",
+    )
     _add_sampling_args(generate)
 
-    eval_p = sub.add_parser(
+    sub.add_parser(
         "eval",
-        help="Reproduce DeepGrove quality benches (AIME / HMMT / GPQA / LCB)",
-    )
-    eval_p.add_argument("--model", required=True, help="Packed checkpoint directory")
-    eval_p.add_argument(
-        "--bench",
-        default="all",
-        help="Comma-separated: aime2026,hmmt2026,gpqa,lcbv6 or all (default all)",
-    )
-    eval_p.add_argument(
-        "--output",
-        default="evals",
-        help="Directory for JSONL results + summaries (default evals)",
-    )
-    eval_p.add_argument(
-        "--n-samples",
-        type=int,
-        default=4,
-        help="Completions per problem (default 4; MathArena / simple-evals)",
-    )
-    eval_p.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Only the first N problems of each bench (smoke tests)",
-    )
-    eval_p.add_argument(
-        "--max-tokens",
-        type=int,
-        default=64000,
-        help="Max new tokens per sample (default 64000, MathArena cap)",
-    )
-    eval_p.add_argument(
-        "--temperature",
-        type=float,
-        default=1.0,
-        help="Softmax temperature (default 1.0). 0 is greedy argmax",
-    )
-    eval_p.add_argument(
-        "--top-p",
-        type=float,
-        default=0.95,
-        help="Nucleus sampling cutoff after top-k (default 0.95)",
-    )
-    eval_p.add_argument(
-        "--top-k",
-        type=int,
-        default=20,
-        help="Keep the top-k softmax tokens before nucleus (default 20)",
-    )
-    eval_p.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Base CUDA seed; sample i of problem p uses seed+p*n+i (default 0)",
-    )
-    eval_p.add_argument(
-        "--flash-head",
-        action="store_true",
-        help="Approximate lm_head (DeepGrove reported the dense head)",
+        help="Moved to the bench project (OpenAI-compatible quality evals)",
     )
 
     serve = sub.add_parser(
@@ -208,6 +168,135 @@ def main(argv: list[str] | None = None) -> int:
         help="KV cache length per slot, prompt + new tokens (default 8192)",
     )
     _add_sampling_args(serve)
+
+    eggroll = sub.add_parser(
+        "eggroll",
+        help="Post-train packed Maple with EGGROLL (rank-1 evolutionary strategy)",
+    )
+    eggroll.add_argument("--model", required=True, help="Packed checkpoint directory")
+    eggroll.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="Directory for EGGROLL adapters, history.jsonl, and episodes.jsonl",
+    )
+    eggroll.add_argument(
+        "--resume",
+        default=None,
+        help="Existing adapter directory to continue from",
+    )
+    eggroll.add_argument("--steps", type=int, default=50, help="ES steps (default 50)")
+    eggroll.add_argument(
+        "--population",
+        type=int,
+        default=16,
+        help="Population size, even, antithetic pairs (default 16)",
+    )
+    eggroll.add_argument(
+        "--rank",
+        type=int,
+        default=1,
+        help="Perturbation rank (default 1; paper's fast path)",
+    )
+    eggroll.add_argument(
+        "--r-max",
+        type=int,
+        default=32,
+        help="SVD cap on fused residual rank (default 32)",
+    )
+    eggroll.add_argument(
+        "--sigma",
+        type=float,
+        default=0.001,
+        help="Perturbation std (default 0.001)",
+    )
+    eggroll.add_argument(
+        "--lr",
+        type=float,
+        default=0.001,
+        help="ES step size alpha (default 0.001)",
+    )
+    eggroll.add_argument("--seed", type=int, default=0)
+    eggroll.add_argument(
+        "--max-tokens",
+        type=int,
+        default=256,
+        help="Max new tokens per rollout (default 256)",
+    )
+    eggroll.add_argument(
+        "--max-tool-rounds",
+        type=int,
+        default=6,
+        help="Max tool-call rounds per agent task (default 6)",
+    )
+    eggroll.add_argument(
+        "--prompts-per-step",
+        type=int,
+        default=4,
+        help="Tasks mixed into each ES step (default 4)",
+    )
+    eggroll.add_argument(
+        "--max-batch",
+        type=int,
+        default=8,
+        help=(
+            "Concurrent decode slots for same-member single-turn rollouts "
+            "(default 8). Tool-call episodes stay serial. Raise "
+            "--prompts-per-step to fill the batch"
+        ),
+    )
+    eggroll.add_argument(
+        "--modules",
+        default="qkv,o_proj,down,lm_head",
+        help="Comma-separated adapters (router is frozen by default)",
+    )
+    eggroll.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Score the suite without taking an ES step",
+    )
+    eggroll.add_argument(
+        "--save-every",
+        type=int,
+        default=10,
+        help="Write adapters every N steps (default 10)",
+    )
+    eggroll.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Rollout temperature (default 0 greedy, as in eggroll-vllm)",
+    )
+    eggroll.add_argument("--top-p", type=float, default=0.95)
+    eggroll.add_argument("--top-k", type=int, default=20)
+    eggroll.add_argument(
+        "--env",
+        default=None,
+        help=(
+            "Comma-separated env plugins from maple_run.eggroll_envs or --env-dir "
+            "(e.g. RefusalEnv,DoomEnv,ProceduralSearch,NemotronIPI). "
+            "Default is the built-in 21-prompt suite. Base types (SearchEnv, "
+            "CodingEnv) must be subclassed."
+        ),
+    )
+    eggroll.add_argument(
+        "--env-dir",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="Directory of extra env plugins (also auto-loads ./eggroll_envs if present)",
+    )
+    eggroll.add_argument(
+        "--trace-text",
+        action="store_true",
+        help="Store full prompt/text/reasoning in episodes.jsonl (default: truncate)",
+    )
+    eggroll.add_argument(
+        "--trace-chars",
+        type=int,
+        default=2000,
+        help="Max chars of prompt/text/reasoning per episode (default 2000; 0 omits them)",
+    )
 
     args = parser.parse_args(argv)
     if args.cmd == "convert":
@@ -253,32 +342,7 @@ def main(argv: list[str] | None = None) -> int:
             top_k=args.top_k,
             seed=args.seed,
             flash_head=args.flash_head,
-        )
-        return 0
-    if args.cmd == "eval":
-        _validate_sampling_args(parser, args)
-        if args.n_samples < 1:
-            parser.error("--n-samples must be >= 1")
-        if args.limit is not None and args.limit < 0:
-            parser.error("--limit must be >= 0")
-        from maple_run.eval import parse_benches, run_eval
-
-        try:
-            benches = parse_benches(args.bench)
-        except ValueError as exc:
-            parser.error(str(exc))
-        run_eval(
-            args.model,
-            benches,
-            output_dir=args.output,
-            n_samples=args.n_samples,
-            max_tokens=args.max_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            seed=args.seed,
-            flash_head=args.flash_head,
-            limit=args.limit,
+            eggroll=args.eggroll,
         )
         return 0
     if args.cmd == "serve":
@@ -303,6 +367,86 @@ def main(argv: list[str] | None = None) -> int:
             flash_head=args.flash_head,
             max_batch=args.max_batch,
             max_len=args.max_len,
+        )
+        return 0
+    if args.cmd == "eggroll":
+        if args.population < 2 or args.population % 2:
+            parser.error("--population must be even and >= 2")
+        if args.rank < 1:
+            parser.error("--rank must be >= 1")
+        if args.r_max < args.rank:
+            parser.error("--r-max must be >= --rank")
+        if args.sigma <= 0:
+            parser.error("--sigma must be > 0")
+        if args.lr <= 0:
+            parser.error("--lr must be > 0")
+        if args.steps < 0:
+            parser.error("--steps must be >= 0")
+        if args.max_tool_rounds < 1:
+            parser.error("--max-tool-rounds must be >= 1")
+        if args.prompts_per_step < 1:
+            parser.error("--prompts-per-step must be >= 1")
+        if args.max_batch < 1:
+            parser.error("--max-batch must be >= 1")
+        if args.temperature < 0:
+            parser.error("--temperature must be >= 0")
+        if args.top_p <= 0 or args.top_p > 1:
+            parser.error("--top-p must be in (0, 1]")
+        if args.top_k < 0:
+            parser.error("--top-k must be >= 0")
+        if args.max_tokens < 1:
+            parser.error("--max-tokens must be >= 1")
+        if args.trace_chars < 0:
+            parser.error("--trace-chars must be >= 0")
+        env_dirs = tuple(args.env_dir or ())
+        if args.env:
+            from maple_run.eggroll.envs import get_envs, load_plugins
+
+            names = [n.strip() for n in args.env.split(",") if n.strip()]
+            if not names:
+                parser.error("--env must list at least one plugin name")
+            try:
+                load_plugins(list(env_dirs) if env_dirs else None)
+                get_envs(names)
+            except (KeyError, TypeError, FileNotFoundError) as exc:
+                parser.error(str(exc))
+        elif env_dirs:
+            from maple_run.eggroll.envs import load_plugins
+
+            try:
+                load_plugins(list(env_dirs))
+            except FileNotFoundError as exc:
+                parser.error(str(exc))
+        from maple_run.eggroll.train import TrainConfig, train
+
+        modules = tuple(m.strip() for m in args.modules.split(",") if m.strip())
+        train(
+            TrainConfig(
+                model_dir=args.model,
+                output_dir=args.output,
+                resume=args.resume,
+                steps=args.steps,
+                population=args.population,
+                rank=args.rank,
+                r_max=args.r_max,
+                sigma=args.sigma,
+                lr=args.lr,
+                seed=args.seed,
+                max_tokens=args.max_tokens,
+                max_tool_rounds=args.max_tool_rounds,
+                prompts_per_step=args.prompts_per_step,
+                max_batch=args.max_batch,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                modules=modules,
+                eval_only=args.eval_only,
+                save_every=args.save_every,
+                env_names=args.env,
+                env_dirs=env_dirs,
+                trace_text=args.trace_text,
+                trace_chars=args.trace_chars,
+            )
         )
         return 0
     parser.error(f"unknown command {args.cmd}")

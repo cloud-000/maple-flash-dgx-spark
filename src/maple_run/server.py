@@ -676,6 +676,10 @@ class PackedEngine:
             elif len(row.token_ids) >= row.max_tokens:
                 row.finish_reason = "length"
                 finished.append(slot)
+            elif self._cache.seen[slot] >= self.max_len:
+                # Last KV slot is full; another decode would index RoPE/KV OOB.
+                row.finish_reason = "length"
+                finished.append(slot)
         for slot in reversed(finished):
             last = self._live - 1
             if slot != last:

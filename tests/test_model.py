@@ -291,6 +291,24 @@ def test_global_layer_skips_rope():
     assert not torch.allclose(y_rope, y_nope, rtol=1e-3, atol=1e-3)
 
 
+def test_rotary_gather_clamps_oob_index():
+    """OOB positions must not CUDA-assert; clamp to the last cached angle."""
+    from maple_run.model import MapleRotaryEmbedding
+
+    rot = MapleRotaryEmbedding(64, 0.5, 10000.0, torch.device("cpu"))
+    last = torch.tensor([[rot.max_cached - 1]])
+    oob = torch.tensor([[rot.max_cached + 1000]])
+    cos_last, sin_last = rot.gather(last, torch.float32)
+    cos_oob, sin_oob = rot.gather(oob, torch.float32)
+    torch.testing.assert_close(cos_oob, cos_last)
+    torch.testing.assert_close(sin_oob, sin_last)
+    many = torch.tensor([[0, rot.max_cached + 5]])
+    cos_m, _ = rot.gather(many, torch.float32)
+    cos_0, _ = rot.gather(torch.tensor([[0]]), torch.float32)
+    torch.testing.assert_close(cos_m[0, 0], cos_0.view(-1))
+    torch.testing.assert_close(cos_m[0, 1], cos_last.view(-1))
+
+
 def test_from_packed_rejects_unpacked_config(tmp_path: Path):
     from maple_run.model import MapleForCausalLM
 
@@ -384,6 +402,40 @@ def test_batched_generate_prompt_lengths_and_shapes():
     assert r.n_new == 18
     assert r.steps == 5
     assert r.decode_tok_s > 0
+
+
+@cuda
+def test_batched_generate_per_row_max_new():
+    from maple_run.generate import batched_generate
+
+    model, cfg = _tiny_batch_model()
+    torch.manual_seed(1)
+    prompts = [
+        torch.randint(0, cfg["vocab_size"], (n,), device="cuda") for n in (3, 5, 4)
+    ]
+    r = batched_generate(
+        model, prompts, max_tokens=10, max_new=[2, 7, 4], stop_ids=set()
+    )
+    assert [len(t) for t in r.token_ids] == [2, 7, 4]
+    assert r.finish_reasons == ["length", "length", "length"]
+
+
+@cuda
+def test_batched_generate_reuses_cache_after_swap():
+    from maple_run.generate import batched_generate
+
+    model, cfg = _tiny_batch_model()
+    cache = model.make_cache(max_len=32, batch=3)
+    cache.remap = True
+    cache.swap_slots(0, 2)
+    prompts = [
+        torch.randint(0, cfg["vocab_size"], (n,), device="cuda") for n in (2, 3, 4)
+    ]
+    r = batched_generate(
+        model, prompts, max_tokens=4, stop_ids=set(), cache=cache
+    )
+    assert r.prompt_lens == [2, 3, 4]
+    assert [len(t) for t in r.token_ids] == [4, 4, 4]
 
 
 @cuda

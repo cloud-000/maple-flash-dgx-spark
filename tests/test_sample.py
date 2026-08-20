@@ -99,6 +99,8 @@ def test_resolve_max_tokens_minus_one_fills_remaining_context():
     assert resolve_max_tokens(-1, DEFAULT_MAX_CONTEXT, DEFAULT_MAX_CONTEXT) == 0
     assert resolve_max_tokens(-1, DEFAULT_MAX_CONTEXT + 8, DEFAULT_MAX_CONTEXT) == 0
     assert resolve_max_tokens(128, 100, DEFAULT_MAX_CONTEXT) == 128
+    assert resolve_max_tokens(64000, 100, 8192) == 8092
+    assert resolve_max_tokens(128, 100, 150) == 50
     with pytest.raises(ValueError, match="-1"):
         resolve_max_tokens(-2, 10, DEFAULT_MAX_CONTEXT)
 

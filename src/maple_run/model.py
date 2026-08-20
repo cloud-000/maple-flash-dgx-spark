@@ -93,6 +93,13 @@ class MapleRotaryEmbedding:
 
     def gather(self, position_ids: torch.Tensor, dtype: torch.dtype):
         idx = position_ids.long()
+        # Out-of-place clamp: a CUDA-graph replay of `index_select` with an
+        # OOB index device-asserts and poisons the context. Valid positions
+        # are a no-op. Do not clamp_ — `position_ids` may view `cache.seqlen`.
+        n = self.max_cached
+        if n <= 0:
+            raise RuntimeError("RoPE table is empty")
+        idx = idx.clamp(0, n - 1)
         if idx.numel() == 1:
             cos = self.cos_table.index_select(0, idx.reshape(1)).to(dtype)
             sin = self.sin_table.index_select(0, idx.reshape(1)).to(dtype)
@@ -217,6 +224,19 @@ class KVCache:
         """Forget a slot's history so a new sequence can take it."""
         self.seen[slot] = 0
         self.seqlen[slot] = 0
+
+    def reset_identity(self) -> None:
+        """Identity slot map and zero lengths so a new batch can reuse this cache."""
+        self.remap = False
+        self.slot = None
+        self.row_of = list(range(self.batch))
+        self.row_map.copy_(
+            torch.arange(
+                self.batch, device=self.row_map.device, dtype=self.row_map.dtype
+            )
+        )
+        for b in range(self.batch):
+            self.reset_slot(b)
 
     def past(self) -> int:
         """Tokens already cached, for the position ids of a prefill chunk."""

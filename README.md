@@ -13,11 +13,15 @@ uv run maple-run generate --model checkpoints/maple-2bit \
 uv run maple-run generate --model checkpoints/maple-2bit --flash-head \
   --prompt "Write a haiku about a grove." --max-tokens 128
 uv run maple-run serve --model checkpoints/maple-2bit --host 127.0.0.1 --port 8000
-uv run maple-run eval --model checkpoints/maple-2bit --output evals/maple-2bit
-uv run maple-run eval --model checkpoints/maple-2bit --bench aime2026 --limit 1 --n-samples 1
 ```
 
-`eval` reproduces DeepGrove's quality table (LCBv6, AIME 2026, HMMT Feb 2026, GPQA-D) on the **dense** 4-bit `lm_head` with packed kernels. Default protocol is T=1.0 / top_p=0.95 / top_k=20, 4 samples, 64k max tokens. Results resume from `--output`.
+Quality evals (LCBv6, AIME 2026, HMMT Feb 2026, GPQA-D) live in the sibling [`bench`](../bench) project and talk to `maple-run serve` over OpenAI `/v1/chat/completions`. Dense-head protocol is T=1.0 / top_p=0.95 / top_k=20, 4 samples, 64k max tokens.
+
+```bash
+uv run --directory ../bench bench eval \
+  --base-url http://127.0.0.1:8000/v1 --model maple-2bit \
+  --output runs/maple-2bit
+```
 
 ```bash
 uv sync

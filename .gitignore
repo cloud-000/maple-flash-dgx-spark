@@ -26,3 +26,13 @@ docs/sources/
 
 # tmp
 tmp_ab_speed.py
+tmp
+
+# AI
+.claude/
+.agents/
+.gemini/
+GEMINI.md
+CLAUDE.md
+
+.ruff_cache/

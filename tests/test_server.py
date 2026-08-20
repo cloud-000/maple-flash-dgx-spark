@@ -599,6 +599,30 @@ def test_scheduler_overlapping_jobs_match_solo():
 
 
 @cuda
+def test_scheduler_caps_decode_to_max_len():
+    """A 64k max_tokens request must stop at remaining KV slots, not CUDA-assert."""
+    model, cfg = _tiny_batch_model()
+    prompt = torch.randint(1, cfg["vocab_size"], (4,), device="cuda")
+    engine = PackedEngine(
+        model, None, ServerDefaults(max_batch=1, max_len=16, model_id="tiny")
+    )
+    try:
+        engine.wait_ready()
+        result = engine.run(
+            prompt, max_tokens=64000, temperature=0.0, top_k=1, stop_ids=set()
+        )
+        assert result.finish_reason == "length"
+        assert result.n_new == 12  # max_len 16 - prompt 4
+        # CUDA context must still be usable for the next request.
+        second = engine.run(
+            prompt, max_tokens=4, temperature=0.0, top_k=1, stop_ids=set()
+        )
+        assert len(second.token_ids) == 4
+    finally:
+        engine.close()
+
+
+@cuda
 def test_scheduler_padding_seqlen_stays_reset():
     """A width-2 graph with one live row must not grow the free slot's seqlen."""
     model, cfg = _tiny_batch_model()

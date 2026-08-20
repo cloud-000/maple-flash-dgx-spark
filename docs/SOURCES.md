@@ -83,7 +83,7 @@ Ternarize arithmetic in **float32**; only final `alpha` returns to weight dtype.
 ## Quality benches (DeepGrove Maple-Preview table)
 
 DeepGrove reported dense-head scores on LCBv6 / AIME 2026 / HMMT 2026 / GPQA-D
-(78.7% mean). They did not publish a harness. `maple-run eval` uses:
+(78.7% mean). They did not publish a harness. The sibling `bench` project uses:
 
 - MathArena AIME 2026: https://huggingface.co/datasets/MathArena/aime_2026
   config https://github.com/eth-sri/matharena/blob/main/configs/competitions/aime/aime_2026.yaml
