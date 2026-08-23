@@ -18,7 +18,7 @@ from maple_run.eggroll.rollout import (
     run_single_turn_batch,
     run_task,
 )
-from maple_run.eggroll.tasks import Task, default_suite, sample_batch
+from maple_run.eggroll.tasks import Task, item_kind, sample_batch
 from maple_run.generate import DEFAULT_TOP_K, DEFAULT_TOP_P, load_packed, warmup_model
 
 DEFAULT_TRACE_CHARS = 2000
@@ -48,6 +48,10 @@ class TrainConfig:
     save_every: int = 10
     env_names: str | None = None
     env_dirs: tuple[str, ...] = ()
+    recipe_name: str = "default"
+    recipe_dirs: tuple[str, ...] = ()
+    recipe_defaults: dict = field(default_factory=dict)
+    cli_overrides: dict = field(default_factory=dict)
     trace_text: bool = False
     trace_chars: int = DEFAULT_TRACE_CHARS
     log: Callable[[str], None] = print
@@ -104,35 +108,70 @@ def _append_jsonl(path: Path, rec: dict) -> None:
         f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
 
 
+def _jsonable(value):
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    return value
+
+
+def _item_env_name(item) -> str:
+    env = getattr(item, "env", None)
+    if env is not None:
+        return type(env).__name__
+    return type(item).__name__
+
+
 def _config_public(cfg: TrainConfig, *, suite: list) -> dict:
-    kinds = sorted({getattr(t, "kind", type(t).__name__) for t in suite})
+    kinds = sorted({item_kind(t) for t in suite})
+    env_names = sorted({_item_env_name(t) for t in suite})
     return {
-        "model_dir": cfg.model_dir,
-        "output_dir": cfg.output_dir,
-        "resume": cfg.resume,
-        "steps": cfg.steps,
-        "population": cfg.population,
-        "rank": cfg.rank,
-        "r_max": cfg.r_max,
-        "sigma": cfg.sigma,
-        "lr": cfg.lr,
-        "seed": cfg.seed,
-        "max_tokens": cfg.max_tokens,
-        "max_tool_rounds": cfg.max_tool_rounds,
-        "prompts_per_step": cfg.prompts_per_step,
-        "max_batch": cfg.max_batch,
-        "temperature": cfg.temperature,
-        "top_p": cfg.top_p,
-        "top_k": cfg.top_k,
-        "modules": list(cfg.modules),
-        "eval_only": cfg.eval_only,
-        "save_every": cfg.save_every,
-        "env_names": cfg.env_names,
-        "env_dirs": list(cfg.env_dirs),
-        "trace_text": cfg.trace_text,
-        "trace_chars": cfg.trace_chars,
-        "suite_size": len(suite),
-        "suite_kinds": kinds,
+        "recipe": {
+            "name": cfg.recipe_name or "default",
+            "defaults": _jsonable(dict(cfg.recipe_defaults or {})),
+            "dirs": list(cfg.recipe_dirs),
+            "environments": env_names,
+        },
+        "environment": {
+            "names": cfg.env_names,
+            "dirs": list(cfg.env_dirs),
+            "kinds": kinds,
+            "suite_size": len(suite),
+        },
+        "rollout": {
+            "max_tokens": cfg.max_tokens,
+            "max_tool_rounds": cfg.max_tool_rounds,
+            "prompts_per_step": cfg.prompts_per_step,
+            "max_batch": cfg.max_batch,
+            "temperature": cfg.temperature,
+            "top_p": cfg.top_p,
+            "top_k": cfg.top_k,
+            "trace_text": cfg.trace_text,
+            "trace_chars": cfg.trace_chars,
+        },
+        "optimizer": {
+            "steps": cfg.steps,
+            "population": cfg.population,
+            "rank": cfg.rank,
+            "r_max": cfg.r_max,
+            "sigma": cfg.sigma,
+            "lr": cfg.lr,
+            "seed": cfg.seed,
+            "modules": list(cfg.modules),
+            "save_every": cfg.save_every,
+        },
+        "cli": {
+            "model_dir": cfg.model_dir,
+            "output_dir": cfg.output_dir,
+            "resume": cfg.resume,
+            "eval_only": cfg.eval_only,
+            "recipe": cfg.recipe_name or "default",
+            "recipe_dirs": list(cfg.recipe_dirs),
+            "env": cfg.env_names,
+            "env_dirs": list(cfg.env_dirs),
+            "overrides": _jsonable(dict(cfg.cli_overrides or {})),
+        },
     }
 
 
@@ -191,13 +230,14 @@ def _episode_record(
     task = ep.task
     if task is not None:
         rec["weight"] = task.weight
-        rec["should_refuse"] = task.should_refuse
-        rec["gold"] = task.gold
-        rec["inject_error"] = task.inject_error
-        if task.env is not None:
-            rec["env"] = type(task.env).__name__
+        rec["meta"] = dict(task.meta)
+        rec["env"] = type(task.env).__name__
+        rec["should_refuse"] = task.meta.get("should_refuse")
+        rec["gold"] = task.meta.get("gold")
+        rec["inject_error"] = task.meta.get("inject_error")
         if include_text:
-            rec["prompt"] = task.prompt if limit is None else _clip(task.prompt, limit)
+            prompt = task.env.prompt(task.inst)
+            rec["prompt"] = prompt if limit is None else _clip(prompt, limit)
     if include_text:
         rec["text"] = ep.text if limit is None else _clip(ep.text, limit)
         rec["reasoning"] = ep.reasoning if limit is None else _clip(ep.reasoning, limit)
@@ -310,12 +350,14 @@ def resolve_suite(cfg: TrainConfig, suite: list | None) -> list:
     if suite is not None:
         return suite
     from maple_run.eggroll.envs import get_envs, load_plugins
+    from maple_run.eggroll.recipes import get_recipe, load_recipe_plugins
 
     load_plugins(list(cfg.env_dirs) if cfg.env_dirs else None)
+    load_recipe_plugins(list(cfg.recipe_dirs) if cfg.recipe_dirs else None)
     if cfg.env_names:
         names = [n.strip() for n in cfg.env_names.split(",") if n.strip()]
         return get_envs(names)
-    return default_suite()
+    return get_recipe(cfg.recipe_name or "default").environments()
 
 
 def evaluate_baseline(
@@ -326,7 +368,7 @@ def evaluate_baseline(
     suite: list | None = None,
     generate_fn: GenerateFn | None = None,
 ) -> dict[str, float]:
-    suite = expand_suite(suite if suite is not None else default_suite())
+    suite = expand_suite(resolve_suite(cfg, suite))
     fit, by_kind, _ = evaluate_tasks(
         model, tokenizer, suite, cfg, generate_fn=generate_fn, seed=cfg.seed
     )
@@ -373,6 +415,13 @@ def train(
     if cfg.trace_chars < 0:
         raise ValueError("trace_chars must be >= 0")
     suite = resolve_suite(cfg, suite)
+    if not cfg.recipe_defaults:
+        from maple_run.eggroll.recipes import get_recipe
+
+        try:
+            cfg.recipe_defaults = get_recipe(cfg.recipe_name or "default").defaults()
+        except KeyError:
+            pass
     if model is None or tokenizer is None:
         model, tokenizer = _load_model(cfg)
     runtime = _attach_runtime(model, cfg)

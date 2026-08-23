@@ -1,4 +1,8 @@
-"""Single-turn and multi-turn rollouts for EGGROLL fitness."""
+"""Single-turn and multi-step tool rollouts for EGGROLL fitness.
+
+The engine owns generation and tool-call orchestration. Environments own
+prompts, tools, episode state, and evaluation. ES only sees EpisodeResult.
+"""
 
 from __future__ import annotations
 
@@ -7,16 +11,9 @@ from typing import Any, Callable
 
 from maple_run.eggroll.envs.base import Episode
 from maple_run.eggroll.envs.machine import RegisterMachine as ToolEnv
-from maple_run.eggroll.rewards import (
-    doom_score,
-    ngram_repetition,
-    parse_tool_args,
-    reasoning_score,
-    refusal_score,
-    tool_call_key,
-    tool_episode_score,
-)
+from maple_run.eggroll.rewards import doom_score, ngram_repetition, tool_call_key
 from maple_run.eggroll.tasks import Task
+from maple_run.eggroll.tools import ToolContext, as_tools, invoke_tool, tool_schemas
 from maple_run.generate import (
     CompletionDecoder,
     GenerateResult,
@@ -69,18 +66,13 @@ def _from_generate(result: GenerateResult) -> dict[str, Any]:
 
 
 def task_token_cap(task: Task, max_tokens: int) -> int:
-    cap = task.max_tokens if task.max_tokens is not None else max_tokens
-    return int(cap)
+    cap = task.env.max_new(task.inst)
+    return int(cap if cap is not None else max_tokens)
 
 
 def needs_agent_loop(task: Task) -> bool:
     """True when the next prompt depends on a tool observation."""
-    if task.env is not None:
-        tools = task.tools
-        if tools is None:
-            tools = task.env.tools(task.inst)
-        return bool(tools)
-    return bool(task.tools) or task.kind == "tool"
+    return bool(as_tools(task.env.tools(task.inst)))
 
 
 def _hit_cap(result: GenerateResult, cap: int) -> bool:
@@ -89,7 +81,20 @@ def _hit_cap(result: GenerateResult, cap: int) -> bool:
     )
 
 
-def score_single_turn(task: Task, result: GenerateResult, cap: int) -> EpisodeResult:
+def _opening(task: Task) -> str | list[dict]:
+    msgs = task.env.messages(task.inst)
+    if msgs:
+        return [dict(m) for m in msgs]
+    return task.env.prompt(task.inst)
+
+
+def score_single_turn(
+    task: Task,
+    result: GenerateResult,
+    cap: int,
+    *,
+    state: Any = None,
+) -> EpisodeResult:
     """Fitness for a completed single-turn generate. Env ``reset`` already ran."""
     doom = doom_score(
         result.text,
@@ -98,36 +103,18 @@ def score_single_turn(task: Task, result: GenerateResult, cap: int) -> EpisodeRe
         hit_max_tokens=_hit_cap(result, cap),
         n_new=result.n_new,
     )
-    if task.env is not None:
-        episode = Episode(
-            inst=task.inst,
-            texts=[result.text],
-            reasoning=result.reasoning,
-            tool_calls=list(result.tool_calls),
-            n_new=result.n_new,
-            doom=doom,
-        )
-        verify, parts = task.env.verify(task.inst, episode)
-        parts = {"doom": doom, **parts}
-        fit = task.env.combine(verify, doom)
-        return EpisodeResult(
-            fitness=float(task.weight) * fit,
-            kind=task.kind,
-            parts=parts,
-            task=task,
-            **_from_generate(result),
-        )
-    if task.kind == "doom":
-        fit = doom
-        parts = {"doom": doom}
-    elif task.kind == "refusal":
-        ref = refusal_score(result.text, should_refuse=bool(task.should_refuse))
-        fit = 0.7 * ref + 0.3 * doom
-        parts = {"refusal": ref, "doom": doom}
-    else:
-        reason = reasoning_score(result.text, task.gold, reasoning=result.reasoning)
-        fit = 0.8 * reason + 0.2 * doom
-        parts = {"reason": reason, "doom": doom}
+    episode = Episode(
+        inst=task.inst,
+        state=state,
+        texts=[result.text],
+        reasoning=result.reasoning,
+        tool_calls=list(result.tool_calls),
+        n_new=result.n_new,
+        doom=doom,
+    )
+    verify, parts = task.env.verify(task.inst, episode)
+    parts = {"doom": doom, **parts}
+    fit = task.env.combine(verify, doom)
     return EpisodeResult(
         fitness=float(task.weight) * fit,
         kind=task.kind,
@@ -205,13 +192,17 @@ def run_single_turn_batch(
                 seed=seed,
             )
         ]
-    for task in tasks:
-        if task.env is not None:
-            task.env.reset(task.inst)
+    states = [task.env.reset(task.inst) for task in tasks]
     caps = [task_token_cap(task, max_tokens) for task in tasks]
-    prompt_ids = [
-        encode_user_prompt(tokenizer, task.prompt, model.device) for task in tasks
-    ]
+    prompt_ids = []
+    for task in tasks:
+        msgs = task.env.messages(task.inst)
+        if msgs:
+            prompt_ids.append(encode_messages(tokenizer, msgs, model.device))
+        else:
+            prompt_ids.append(
+                encode_user_prompt(tokenizer, task.env.prompt(task.inst), model.device)
+            )
     stop_ids = stop_token_ids(model, tokenizer)
     batched = batched_generate(
         model,
@@ -233,8 +224,8 @@ def run_single_turn_batch(
         skip_ids=skip_decode_ids(tokenizer, extra=stop_ids),
     )
     scored = [
-        score_single_turn(task, result, cap)
-        for task, result, cap in zip(tasks, results, caps, strict=True)
+        score_single_turn(task, result, cap, state=state)
+        for task, result, cap, state in zip(tasks, results, caps, states, strict=True)
     ]
     # Packed GEMM timings are for the whole chunk, not per row.
     batch_id = id(batched)
@@ -265,7 +256,7 @@ class EpisodeResult:
 def _run_once(
     model,
     tokenizer,
-    prompt: str,
+    prompt: str | list,
     *,
     tools: list | None = None,
     max_tokens: int,
@@ -287,12 +278,14 @@ def _run_once(
             top_k=top_k,
             seed=seed,
         )
-    if tools:
+    if tools or not isinstance(prompt, str):
+        messages = (
+            prompt
+            if isinstance(prompt, list)
+            else [{"role": "user", "content": prompt}]
+        )
         input_ids = encode_messages(
-            tokenizer,
-            [{"role": "user", "content": prompt}],
-            model.device,
-            tools=tools,
+            tokenizer, messages, model.device, tools=tools
         )
     else:
         input_ids = encode_user_prompt(tokenizer, prompt, model.device)
@@ -324,114 +317,30 @@ def run_task(
     generate_fn: GenerateFn | None = None,
 ) -> EpisodeResult:
     cap = task_token_cap(task, max_tokens)
-    if task.env is not None:
-        return _run_plugin_task(
-            model,
-            tokenizer,
-            task,
-            max_tokens=cap,
-            max_tool_rounds=max_tool_rounds,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            seed=seed,
-            generate_fn=generate_fn,
-        )
-    if task.kind == "tool":
-        return _run_tool_task(
-            model,
-            tokenizer,
-            task,
-            max_tokens=cap,
-            max_tool_rounds=max_tool_rounds,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            seed=seed,
-            generate_fn=generate_fn,
-        )
-    result = _run_once(
-        model,
-        tokenizer,
-        task.prompt,
-        max_tokens=cap,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        seed=seed,
-        generate_fn=generate_fn,
-    )
-    return score_single_turn(task, result, cap)
-
-
-def _run_plugin_task(
-    model,
-    tokenizer,
-    task: Task,
-    *,
-    max_tokens: int,
-    max_tool_rounds: int,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    seed: int | None,
-    generate_fn: GenerateFn | None,
-) -> EpisodeResult:
-    env = task.env
-    inst = task.inst
-    tools = env.tools(inst)
-    rounds = env.max_rounds(inst)
-    if rounds is None:
-        rounds = max_tool_rounds
-    env.reset(inst)
+    tools = as_tools(task.env.tools(task.inst))
     if not tools:
+        state = task.env.reset(task.inst)
         result = _run_once(
             model,
             tokenizer,
-            task.prompt,
-            max_tokens=max_tokens,
+            _opening(task),
+            max_tokens=cap,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             seed=seed,
             generate_fn=generate_fn,
         )
-        hit_cap = result.finish_reason == "length" or (
-            result.n_new >= max_tokens and result.finish_reason != "stop"
-        )
-        doom = doom_score(
-            result.text,
-            reasoning=result.reasoning,
-            tool_calls=result.tool_calls,
-            hit_max_tokens=hit_cap,
-            n_new=result.n_new,
-        )
-        episode = Episode(
-            inst=inst,
-            texts=[result.text],
-            reasoning=result.reasoning,
-            tool_calls=list(result.tool_calls),
-            n_new=result.n_new,
-            doom=doom,
-        )
-        verify, parts = env.verify(inst, episode)
-        parts = {"doom": doom, **parts}
-        fit = env.combine(verify, doom)
-        return EpisodeResult(
-            fitness=float(task.weight) * fit,
-            kind=task.kind,
-            parts=parts,
-            task=task,
-            **_from_generate(result),
-        )
+        return score_single_turn(task, result, cap, state=state)
+    rounds = task.env.max_rounds(task.inst)
+    if rounds is None:
+        rounds = max_tool_rounds
     return _run_agent_loop(
         model,
         tokenizer,
         task,
-        env=env,
-        inst=inst,
         tools=tools,
-        max_tokens=max_tokens,
+        max_tokens=cap,
         max_tool_rounds=rounds,
         temperature=temperature,
         top_p=top_p,
@@ -446,8 +355,6 @@ def _run_agent_loop(
     tokenizer,
     task: Task,
     *,
-    env,
-    inst: Any,
     tools: list,
     max_tokens: int,
     max_tool_rounds: int,
@@ -457,14 +364,20 @@ def _run_agent_loop(
     seed: int | None,
     generate_fn: GenerateFn | None,
 ) -> EpisodeResult:
+    env = task.env
+    inst = task.inst
+    schemas = tool_schemas(tools)
+    state = env.reset(inst)
+    msgs = env.messages(inst)
     messages: list[dict] = (
-        [dict(m) for m in task.messages]
-        if task.messages
-        else [{"role": "user", "content": task.prompt}]
+        [dict(m) for m in msgs]
+        if msgs
+        else [{"role": "user", "content": env.prompt(inst)}]
     )
-    episode = Episode(inst=inst, messages=messages)
+    episode = Episode(inst=inst, messages=messages, state=state)
+    ctx = ToolContext(env=env, inst=inst, state=state)
     last_reason = ""
-    first = messages if task.messages else task.prompt
+    first: str | list = messages if msgs else env.prompt(inst)
     prompt_len = 0
     prefill_s = 0.0
     decode_s = 0.0
@@ -476,7 +389,7 @@ def _run_agent_loop(
             model,
             tokenizer,
             first if round_i == 0 else messages,
-            tools=tools,
+            tools=schemas,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -508,28 +421,26 @@ def _run_agent_loop(
         )
         for call in result.tool_calls:
             episode.tool_calls.append(call)
-            fn = call.get("function") or {}
-            name = str(fn.get("name") or "")
-            args = parse_tool_args(call)
-            obs, ok = env.step(name, args)
-            if ok:
+            outcome = invoke_tool(tools, call, ctx)
+            if outcome.ok:
                 episode.valid_calls += 1
                 if episode.extra.get("saw_error"):
                     episode.recovered = True
             else:
                 episode.invalid_calls += 1
                 episode.extra["saw_error"] = True
-            if name == "submit" and ok:
-                episode.submitted = True
+            fn = call.get("function") or {}
+            name = str(fn.get("name") or call.get("name") or "")
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
                     "name": name,
-                    "content": obs,
+                    "content": outcome.content,
                 }
             )
-        if episode.submitted or env.done():
+        episode.messages = messages
+        if env.done(state):
             break
         keys = [tool_call_key(c) for c in result.tool_calls]
         if len(keys) >= 2 and len(set(keys)) == 1:
@@ -609,151 +520,4 @@ def _generate_turn(
         seed=seed,
         log=None,
         use_graph=False,
-    )
-
-
-def _run_tool_task(
-    model,
-    tokenizer,
-    task: Task,
-    *,
-    max_tokens: int,
-    max_tool_rounds: int,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    seed: int | None,
-    generate_fn: GenerateFn | None,
-) -> EpisodeResult:
-    env = ToolEnv(
-        dict(task.initial_state),
-        dict(task.target or {}),
-        inject_error=task.inject_error,
-    )
-    messages: list[dict] = [{"role": "user", "content": task.prompt}]
-    valid = invalid = 0
-    recovered = False
-    saw_error = False
-    submitted = False
-    all_calls: list[dict] = []
-    texts: list[str] = []
-    n_new = 0
-    last_reason = ""
-    prompt_len = 0
-    prefill_s = 0.0
-    decode_s = 0.0
-    finish_reason = ""
-    turns: list[dict[str, Any]] = []
-
-    for round_i in range(max(1, max_tool_rounds)):
-        if generate_fn is not None:
-            result = generate_fn(
-                model,
-                tokenizer,
-                task.prompt if round_i == 0 else messages,
-                tools=task.tools,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                seed=None if seed is None else seed + round_i,
-            )
-        else:
-            input_ids = encode_messages(
-                tokenizer, messages, model.device, tools=task.tools
-            )
-            result = run_generate(
-                model,
-                tokenizer,
-                input_ids,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                seed=None if seed is None else seed + round_i,
-                log=None,
-                use_graph=False,
-            )
-        texts.append(result.text)
-        last_reason = result.reasoning
-        n_new += result.n_new
-        if round_i == 0:
-            prompt_len = result.prompt_len
-        prefill_s += result.prefill_s
-        decode_s += result.decode_s
-        finish_reason = result.finish_reason
-        turns.append(_turn_trace(round_i, result))
-        if ngram_repetition(result.text) >= _DOOM_NGRAM_STOP:
-            break
-        if not result.tool_calls:
-            break
-        messages.append(
-            {
-                "role": "assistant",
-                "content": result.text,
-                "tool_calls": result.tool_calls,
-            }
-        )
-        for call in result.tool_calls:
-            all_calls.append(call)
-            fn = call.get("function") or {}
-            name = str(fn.get("name") or "")
-            args = parse_tool_args(call)
-            obs, ok = env.execute(name, args)
-            if ok:
-                valid += 1
-                if saw_error:
-                    recovered = True
-            else:
-                invalid += 1
-                saw_error = True
-            if name == "submit" and ok:
-                submitted = True
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.get("id", ""),
-                    "name": name,
-                    "content": obs,
-                }
-            )
-        if submitted:
-            break
-        keys = [tool_call_key(c) for c in result.tool_calls]
-        if len(keys) >= 2 and len(set(keys)) == 1:
-            break
-
-    blob = "\n".join(texts)
-    doom = doom_score(blob, reasoning=last_reason, tool_calls=all_calls, n_new=n_new)
-    verifier = env.verifier_ok()
-    fit = tool_episode_score(
-        valid_calls=valid,
-        invalid_calls=invalid,
-        recovered=recovered,
-        verifier_ok=verifier,
-        doom=doom,
-        submitted=submitted,
-    )
-    return EpisodeResult(
-        fitness=float(task.weight) * fit,
-        kind="tool",
-        parts={
-            "tools": fit,
-            "doom": doom,
-            "valid": float(valid),
-            "invalid": float(invalid),
-            "verifier": 1.0 if verifier else 0.0,
-            "recovered": 1.0 if recovered else 0.0,
-        },
-        text=blob,
-        reasoning=last_reason,
-        n_new=n_new,
-        tool_calls=len(all_calls),
-        prompt_len=prompt_len,
-        prefill_s=prefill_s,
-        decode_s=decode_s,
-        finish_reason=finish_reason,
-        rounds=len(turns),
-        turns=turns,
-        task=task,
     )

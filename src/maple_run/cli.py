@@ -67,6 +67,29 @@ def _validate_sampling_args(parser: argparse.ArgumentParser, args: argparse.Name
         parser.error("--max-tokens must be >= 0 or -1")
 
 
+def _explicit_cli_dests(parser: argparse.ArgumentParser, argv: list[str] | None) -> set[str]:
+    """Dest names the user actually passed, including subparser flags."""
+    tokens = list(argv if argv is not None else sys.argv[1:])
+    opt_to_dest: dict[str, str] = {}
+
+    def _walk(p: argparse.ArgumentParser) -> None:
+        for action in p._actions:
+            for opt in getattr(action, "option_strings", []) or []:
+                opt_to_dest[opt] = action.dest
+            choices = getattr(action, "choices", None)
+            if isinstance(choices, dict):
+                for sub in choices.values():
+                    _walk(sub)
+
+    _walk(parser)
+    seen: set[str] = set()
+    for tok in tokens:
+        key = tok.split("=", 1)[0]
+        if key in opt_to_dest:
+            seen.add(opt_to_dest[key])
+    return seen
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "eval":
@@ -275,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Comma-separated env plugins from maple_run.eggroll_envs or --env-dir "
             "(e.g. RefusalEnv,DoomEnv,ProceduralSearch,NemotronIPI). "
-            "Default is the built-in 21-prompt suite. Base types (SearchEnv, "
+            "Overrides the environments from --recipe. Base types (SearchEnv, "
             "CodingEnv) must be subclassed."
         ),
     )
@@ -285,6 +308,21 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         metavar="DIR",
         help="Directory of extra env plugins (also auto-loads ./eggroll_envs if present)",
+    )
+    eggroll.add_argument(
+        "--recipe",
+        default="default",
+        help=(
+            "Training recipe (default, agent, ipi, or a plugin from --recipe-dir). "
+            "Supplies environments and hyperparameter defaults; CLI flags override."
+        ),
+    )
+    eggroll.add_argument(
+        "--recipe-dir",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="Directory of extra recipe plugins (also auto-loads ./eggroll_recipes if present)",
     )
     eggroll.add_argument(
         "--trace-text",
@@ -370,31 +408,41 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.cmd == "eggroll":
-        if args.population < 2 or args.population % 2:
+        from maple_run.eggroll.recipes import get_recipe, load_recipe_plugins
+
+        recipe_dirs = tuple(args.recipe_dir or ())
+        try:
+            load_recipe_plugins(list(recipe_dirs) if recipe_dirs else None)
+            recipe = get_recipe(args.recipe)
+        except (KeyError, FileNotFoundError, ImportError) as exc:
+            parser.error(str(exc))
+        explicit = _explicit_cli_dests(parser, argv)
+        resolved, overrides = recipe.resolve(args, explicit)
+        if resolved["population"] < 2 or resolved["population"] % 2:
             parser.error("--population must be even and >= 2")
-        if args.rank < 1:
+        if resolved["rank"] < 1:
             parser.error("--rank must be >= 1")
-        if args.r_max < args.rank:
+        if resolved["r_max"] < resolved["rank"]:
             parser.error("--r-max must be >= --rank")
-        if args.sigma <= 0:
+        if resolved["sigma"] <= 0:
             parser.error("--sigma must be > 0")
-        if args.lr <= 0:
+        if resolved["lr"] <= 0:
             parser.error("--lr must be > 0")
-        if args.steps < 0:
+        if resolved["steps"] < 0:
             parser.error("--steps must be >= 0")
-        if args.max_tool_rounds < 1:
+        if resolved["max_tool_rounds"] < 1:
             parser.error("--max-tool-rounds must be >= 1")
-        if args.prompts_per_step < 1:
+        if resolved["prompts_per_step"] < 1:
             parser.error("--prompts-per-step must be >= 1")
-        if args.max_batch < 1:
+        if resolved["max_batch"] < 1:
             parser.error("--max-batch must be >= 1")
-        if args.temperature < 0:
+        if resolved["temperature"] < 0:
             parser.error("--temperature must be >= 0")
-        if args.top_p <= 0 or args.top_p > 1:
+        if resolved["top_p"] <= 0 or resolved["top_p"] > 1:
             parser.error("--top-p must be in (0, 1]")
-        if args.top_k < 0:
+        if resolved["top_k"] < 0:
             parser.error("--top-k must be >= 0")
-        if args.max_tokens < 1:
+        if resolved["max_tokens"] < 1:
             parser.error("--max-tokens must be >= 1")
         if args.trace_chars < 0:
             parser.error("--trace-chars must be >= 0")
@@ -419,33 +467,21 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error(str(exc))
         from maple_run.eggroll.train import TrainConfig, train
 
-        modules = tuple(m.strip() for m in args.modules.split(",") if m.strip())
         train(
             TrainConfig(
                 model_dir=args.model,
                 output_dir=args.output,
                 resume=args.resume,
-                steps=args.steps,
-                population=args.population,
-                rank=args.rank,
-                r_max=args.r_max,
-                sigma=args.sigma,
-                lr=args.lr,
-                seed=args.seed,
-                max_tokens=args.max_tokens,
-                max_tool_rounds=args.max_tool_rounds,
-                prompts_per_step=args.prompts_per_step,
-                max_batch=args.max_batch,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                top_k=args.top_k,
-                modules=modules,
                 eval_only=args.eval_only,
-                save_every=args.save_every,
                 env_names=args.env,
                 env_dirs=env_dirs,
+                recipe_name=recipe.name,
+                recipe_dirs=recipe_dirs,
+                recipe_defaults=recipe.defaults(),
+                cli_overrides=overrides,
                 trace_text=args.trace_text,
                 trace_chars=args.trace_chars,
+                **resolved,
             )
         )
         return 0

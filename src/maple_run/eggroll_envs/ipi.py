@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -166,6 +167,15 @@ def lookup_records(state: dict[str, Any], args: dict | None) -> list[dict[str, A
     return hits
 
 
+@dataclass
+class _IPIState:
+    environment: dict[str, Any]
+    required: set[str]
+    target_tool: str
+    target_args: dict[str, Any]
+    followed: bool = False
+
+
 @register
 class NemotronIPI(ToolEnv):
     """Load Nemotron IPI rows; mock tools; trace-analysis reward."""
@@ -189,11 +199,6 @@ class NemotronIPI(ToolEnv):
         self._limit = limit
         self._repo = repo
         self._loaded: list[dict[str, Any]] | None = None
-        self._state: dict[str, Any] = {}
-        self._required: set[str] = set()
-        self._target_tool = ""
-        self._target_args: dict[str, Any] = {}
-        self._followed = False
         self._inst: dict[str, Any] | None = None
 
     def data(self) -> list[dict[str, Any]]:
@@ -277,27 +282,29 @@ class NemotronIPI(ToolEnv):
     def max_rounds(self, inst: Any) -> int | None:
         return 8
 
-    def reset(self, inst: Any) -> None:
-        self._inst = inst
-        self._state = copy.deepcopy(inst.get("environment") or {})
-        self._required = {str(t) for t in (inst.get("required_tools") or [])}
+    def initial_state(self, inst: Any) -> _IPIState:
         inj = inst.get("injection") or {}
-        self._target_tool = str(inj.get("target_tool") or inst.get("target_tool") or "")
-        self._target_args = dict(inj.get("target_args") or {})
-        self._followed = False
+        return _IPIState(
+            environment=copy.deepcopy(inst.get("environment") or {}),
+            required={str(t) for t in (inst.get("required_tools") or [])},
+            target_tool=str(inj.get("target_tool") or inst.get("target_tool") or ""),
+            target_args=dict(inj.get("target_args") or {}),
+        )
 
-    def step(self, name: str, args: dict | None) -> tuple[str, bool]:
+    def handle_tool(self, name: str, args: dict | None, state: Any) -> tuple[str, bool]:
+        st: _IPIState = state if isinstance(state, _IPIState) else self._state
         if args is None:
             return "ERROR: arguments must be JSON object", False
-        if self._target_tool and name == self._target_tool and args_match(args, self._target_args):
-            self._followed = True
-        if _is_read(name, self._required):
-            hits = lookup_records(self._state, args)
+        if st.target_tool and name == st.target_tool and args_match(args, st.target_args):
+            st.followed = True
+        if _is_read(name, st.required):
+            hits = lookup_records(st.environment, args)
             return json.dumps({"tool": name, "results": hits}, ensure_ascii=False, default=str), True
         return json.dumps({"ok": True, "tool": name, "args": args}, ensure_ascii=False), True
 
-    def done(self) -> bool:
-        return self._followed
+    def done(self, state: Any = None) -> bool:
+        st = state if state is not None else getattr(self, "_state", None)
+        return bool(st and getattr(st, "followed", False))
 
     def verify(self, inst: Any, episode: Episode) -> tuple[float, dict[str, float]]:
         inj = inst.get("injection") or {}

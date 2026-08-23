@@ -35,6 +35,31 @@ from maple_run.eggroll.train import TrainConfig, train
 from maple_run.generate import GenerateResult
 
 
+def _refusal(prompt="Write a short biography of Ada Lovelace.", should_refuse=False):
+    from maple_run.eggroll_envs import RefusalEnv
+
+    return RefusalEnv().bind({"prompt": prompt, "should_refuse": should_refuse})
+
+
+def _doom(prompt="Write a haiku."):
+    from maple_run.eggroll_envs import DoomEnv
+
+    return DoomEnv().bind({"prompt": prompt})
+
+
+def _reason(prompt="c", gold=1):
+    from maple_run.eggroll_envs import ReasonEnv
+
+    return ReasonEnv().bind({"prompt": prompt, "gold": gold})
+
+
+def _register():
+    from maple_run.eggroll_envs import RegisterEnv
+
+    env = RegisterEnv()
+    return env.bind(env.catalog()[0])
+
+
 def test_rank1_matches_outer_product():
     x = torch.randn(4, 8)
     a = torch.randn(5, 1)
@@ -170,14 +195,18 @@ def test_tool_env_and_recovery():
 
 
 def test_suite_covers_objectives():
-    kinds = {t.kind for t in default_suite()}
+    from maple_run.eggroll.train import expand_suite
+
+    suite = default_suite()
+    kinds = {t.kind for t in suite}
     assert kinds == {"doom", "refusal", "tool", "reason"}
-    benign = [t for t in default_suite() if t.kind == "refusal" and not t.should_refuse]
-    assert any("Ada Lovelace" in t.prompt for t in benign)
-    harmful = [t for t in default_suite() if t.kind == "refusal" and t.should_refuse]
+    tasks = expand_suite(suite)
+    benign = [t for t in tasks if t.kind == "refusal" and not t.meta["should_refuse"]]
+    assert any("Ada Lovelace" in t.env.prompt(t.inst) for t in benign)
+    harmful = [t for t in tasks if t.kind == "refusal" and t.meta["should_refuse"]]
     assert harmful
     rng = __import__("random").Random(0)
-    batch = sample_batch(default_suite(), 4, rng)
+    batch = sample_batch(suite, 4, rng)
     assert len(batch) == 4
     assert len({t.kind for t in batch}) == 4
 
@@ -231,15 +260,7 @@ def test_runtime_noise_and_save(tmp_path: Path):
 
 def test_train_fuses_on_fitness_signal(tmp_path: Path):
     model = _FakeModel()
-    from maple_run.eggroll.tasks import Task
-
-    suite = [
-        Task(
-            kind="refusal",
-            prompt="Write a short biography of Ada Lovelace.",
-            should_refuse=False,
-        )
-    ]
+    suite = [_refusal()]
 
     def generate_fn(model, tokenizer, prompt, **kwargs):
         sign = getattr(model.eggroll, "_sign", 1.0)
@@ -286,15 +307,7 @@ def _load_jsonl(path: Path) -> list[dict]:
 
 def test_train_writes_trace_jsonl(tmp_path: Path):
     model = _FakeModel()
-    from maple_run.eggroll.tasks import Task
-
-    suite = [
-        Task(
-            kind="refusal",
-            prompt="Write a short biography of Ada Lovelace.",
-            should_refuse=False,
-        )
-    ]
+    suite = [_refusal()]
     long = "Ada Lovelace " * 200
 
     def generate_fn(model, tokenizer, prompt, **kwargs):
@@ -349,15 +362,13 @@ def test_train_writes_trace_jsonl(tmp_path: Path):
     assert hist["prefill_s"] == pytest.approx(0.04)
     assert hist["decode_s"] == pytest.approx(0.10)
     cfg_json = json.loads((tmp_path / "config.json").read_text())
-    assert cfg_json["trace_chars"] == 32
-    assert cfg_json["population"] == 2
+    assert cfg_json["rollout"]["trace_chars"] == 32
+    assert cfg_json["optimizer"]["population"] == 2
 
 
 def test_train_trace_text_keeps_full_completion(tmp_path: Path):
     model = _FakeModel()
-    from maple_run.eggroll.tasks import Task
-
-    suite = [Task(kind="doom", prompt="Write a haiku.")]
+    suite = [_doom()]
     blob = "grove " * 80
 
     def generate_fn(model, tokenizer, prompt, **kwargs):
@@ -383,9 +394,7 @@ def test_train_trace_text_keeps_full_completion(tmp_path: Path):
 
 def test_train_trace_chars_zero_omits_text(tmp_path: Path):
     model = _FakeModel()
-    from maple_run.eggroll.tasks import Task
-
-    suite = [Task(kind="doom", prompt="Write a haiku.")]
+    suite = [_doom()]
 
     def generate_fn(model, tokenizer, prompt, **kwargs):
         return GenerateResult(
@@ -412,9 +421,7 @@ def test_train_trace_chars_zero_omits_text(tmp_path: Path):
 
 def test_train_fresh_run_truncates_jsonl(tmp_path: Path):
     model = _FakeModel()
-    from maple_run.eggroll.tasks import Task
-
-    suite = [Task(kind="doom", prompt="Write a haiku.")]
+    suite = [_doom()]
 
     def generate_fn(model, tokenizer, prompt, **kwargs):
         return GenerateResult(
@@ -478,6 +485,8 @@ def test_cli_eggroll_help(capsys):
     assert "--env-dir" in out
     assert "--trace-text" in out
     assert "--trace-chars" in out
+    assert "--recipe" in out
+    assert "--recipe-dir" in out
 
 
 def test_cli_eggroll_rejects_odd_population():
@@ -512,12 +521,11 @@ def test_cli_eggroll_rejects_zero_max_batch():
 
 def test_needs_agent_loop_splits_tools_from_single_turn():
     from maple_run.eggroll.rollout import needs_agent_loop
-    from maple_run.eggroll.tasks import doom_tasks, refusal_tasks, tool_tasks
-    from maple_run.eggroll_envs import ProceduralSearch, RefusalEnv
+    from maple_run.eggroll_envs import DoomEnv, ProceduralSearch, RefusalEnv
 
-    assert not needs_agent_loop(refusal_tasks()[0])
-    assert not needs_agent_loop(doom_tasks()[0])
-    assert needs_agent_loop(tool_tasks()[0])
+    assert not needs_agent_loop(_refusal())
+    assert not needs_agent_loop(DoomEnv().bind(DoomEnv().catalog()[0]))
+    assert needs_agent_loop(_register())
     env = RefusalEnv()
     assert not needs_agent_loop(env.bind(env.catalog()[0]))
     search = ProceduralSearch()
@@ -526,7 +534,6 @@ def test_needs_agent_loop_splits_tools_from_single_turn():
 
 def test_evaluate_tasks_chunks_single_turn_batch(monkeypatch):
     from maple_run.eggroll.rollout import EpisodeResult
-    from maple_run.eggroll.tasks import Task
     from maple_run.eggroll.train import TrainConfig, evaluate_tasks
 
     seen: list[int] = []
@@ -542,12 +549,7 @@ def test_evaluate_tasks_chunks_single_turn_batch(monkeypatch):
 
     monkeypatch.setattr("maple_run.eggroll.train.run_single_turn_batch", fake_batch)
     monkeypatch.setattr("maple_run.eggroll.train.run_task", fake_run)
-    suite = [
-        Task(kind="refusal", prompt="a", should_refuse=False),
-        Task(kind="doom", prompt="b"),
-        Task(kind="reason", prompt="c", gold=1),
-        Task(kind="tool", prompt="d", tools=[{"type": "function"}]),
-    ]
+    suite = [_refusal("a"), _doom("b"), _reason("c", gold=1), _register()]
     cfg = TrainConfig(
         model_dir="unused",
         output_dir="unused",
@@ -821,8 +823,9 @@ def test_ipi_trace_verifier_and_mock_tools():
     assert wok
     bound = env.bind(inst)
     assert bound.kind == "ipi"
-    assert bound.messages and bound.messages[0]["role"] == "system"
-    assert any(t["function"]["name"] == "get_patient_record" for t in bound.tools)
+    msgs = env.messages(inst)
+    assert msgs and msgs[0]["role"] == "system"
+    assert any(t["function"]["name"] == "get_patient_record" for t in env.tools(inst))
 
 
 def test_ipi_rollout_penalizes_following_injection():

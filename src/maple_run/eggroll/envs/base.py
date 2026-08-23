@@ -1,38 +1,34 @@
 """Plugin RL environments for EGGROLL.
 
-Write a subclass (prompts, tools, step, verify). The harness owns generate,
-doom scoring, population, and rank-1 fuse. JSON is data your ``sample()``
-may load, not a required schema.
+Write a subclass (prompts, tools, verify). The harness owns generate, the
+tool loop, doom scoring, population, and rank-1 fuse. JSON is data your
+``sample()`` may load, not a required schema.
 """
 
 from __future__ import annotations
 
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
 from maple_run.eggroll.tasks import Task
+from maple_run.eggroll.tools import (
+    Tool,
+    ToolContext,
+    as_tools,
+    dispatch_named,
+    function_tool,
+)
 
-
-def function_tool(
-    name: str,
-    description: str,
-    properties: dict[str, Any],
-    required: list[str] | None = None,
-) -> dict[str, Any]:
-    """OpenAI-style tool schema, same shape Maple generate already parses."""
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": list(required or []),
-            },
-        },
-    }
+# Re-export so existing plugins keep ``from ...envs.base import function_tool``.
+__all__ = [
+    "Env",
+    "Episode",
+    "SingleTurnEnv",
+    "ToolEnv",
+    "function_tool",
+]
 
 
 @dataclass
@@ -40,6 +36,7 @@ class Episode:
     """Filled by the shared rollout loop, then passed to ``Env.verify``."""
 
     inst: Any
+    state: Any = None
     messages: list[dict[str, Any]] = field(default_factory=list)
     texts: list[str] = field(default_factory=list)
     reasoning: str = ""
@@ -83,7 +80,12 @@ class Env(ABC):
     def prompt(self, inst: Any) -> str:
         ...
 
-    def tools(self, inst: Any) -> list | None:
+    def meta(self, inst: Any) -> dict[str, Any]:
+        """Optional trace metadata copied onto the frozen Task."""
+        return {}
+
+    def tools(self, inst: Any) -> list[Tool] | list[dict] | None:
+        """Return Tool objects (or OpenAI schemas). None/empty → single-turn."""
         return None
 
     def max_new(self, inst: Any) -> int | None:
@@ -92,14 +94,29 @@ class Env(ABC):
     def max_rounds(self, inst: Any) -> int | None:
         return None
 
-    def reset(self, inst: Any) -> None:
-        """Called once per episode before the first generate (tool envs)."""
+    def initial_state(self, inst: Any) -> Any:
+        """Episode state returned from ``reset``. Default: None (stateless)."""
+        return None
 
-    def step(self, name: str, args: dict | None) -> tuple[str, bool]:
-        """Return ``(observation, valid)``. Unused for single-turn envs."""
+    def reset(self, inst: Any) -> Any:
+        """Start an episode. Returns state the tool loop threads through."""
+        self._inst = inst
+        self._state = self.initial_state(inst)
+        return self._state
+
+    def handle_tool(self, name: str, args: dict | None, state: Any) -> tuple[str, bool]:
+        """Domain handler for SchemaTool wrappers. Default: unknown tool."""
         return f"ERROR: unknown tool {name}", False
 
-    def done(self) -> bool:
+    def step(self, name: str, args: dict | None, state: Any = None) -> tuple[str, bool]:
+        """Convenience dispatch through ``tools()``. Prefer the rollout loop."""
+        inst = getattr(self, "_inst", None)
+        st = state if state is not None else getattr(self, "_state", None)
+        ctx = ToolContext(env=self, inst=inst, state=st)
+        result = dispatch_named(as_tools(self.tools(inst)), name, args, ctx)
+        return result.content, result.ok
+
+    def done(self, state: Any = None) -> bool:
         return False
 
     def verify(self, inst: Any, episode: Episode) -> tuple[float, dict[str, float]]:
@@ -115,15 +132,12 @@ class Env(ABC):
         return None
 
     def bind(self, inst: Any) -> Task:
+        copied = copy.deepcopy(inst)
         return Task(
-            kind=self.kind,
-            prompt=self.prompt(inst),
-            weight=self.weight,
-            tools=self.tools(inst),
-            max_tokens=self.max_new(inst),
             env=self,
-            inst=inst,
-            messages=self.messages(inst),
+            inst=copied,
+            meta=dict(self.meta(copied)),
+            weight=float(self.weight),
         )
 
 
@@ -137,7 +151,7 @@ class SingleTurnEnv(Env):
 
 
 class ToolEnv(Env):
-    """Multi-turn tool loop. Implement ``reset`` / ``step`` / ``verify``."""
+    """Multi-turn tool loop. Implement ``tools`` / ``verify``; optional ``handle_tool``."""
 
     kind = "tool"
     abstract = True

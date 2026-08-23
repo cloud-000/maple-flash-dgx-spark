@@ -1,7 +1,7 @@
 """Coding sandbox stub (core base type).
 
 Subclass this in ``maple_run.eggroll_envs`` or ``./eggroll_envs``. The inner
-ES loop must stay in-process; do not shell out from ``step()``.
+ES loop must stay in-process; do not shell out from a tool handler.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ class CodingEnv(ToolEnv):
     def tools(self, inst: Any) -> list:
         return [WRITE_FILE_TOOL]
 
-    def step(self, name: str, args: dict | None) -> tuple[str, bool]:
+    def handle_tool(self, name: str, args: dict | None, state: Any) -> tuple[str, bool]:
         return "ERROR: CodingEnv is a stub", False
 
     def verify(self, inst: Any, episode: Episode) -> tuple[float, dict[str, float]]:
