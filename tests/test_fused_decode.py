@@ -87,16 +87,16 @@ def test_expert_swiglu_and_down_sum_match_split_path():
     )
     residual = torch.from_numpy(rng.standard_normal((n_tok, hidden)).astype(np.float32)).cuda()
 
-    h = ternary_expert_swiglu(x, up_gate_p, up_gate_a, ids)
+    h = ternary_expert_swiglu(x, up_gate_p, up_gate_a, ids, grouped=True)
     y = ternary_expert_down_sum(h, down_pt, down_at, ids, wts, residual=residual)
 
-    up_gate = ternary_expert_gemv(x, up_gate_p, up_gate_a, ids)
+    up_gate = ternary_expert_gemv(x, up_gate_p, up_gate_a, ids, grouped=True)
     up, gate = up_gate.split(inter, dim=-1)
     href = torch.nn.functional.silu(gate.clamp(max=MLP_CLAMP)) * up.clamp(
         min=-MLP_CLAMP, max=MLP_CLAMP
     )
     torch.testing.assert_close(h, href, rtol=1e-4, atol=1e-4)
-    down = ternary_expert_gemv(href, down_pt, down_at, ids)
+    down = ternary_expert_gemv(href, down_pt, down_at, ids, grouped=True)
     ref = residual + (down.float() * wts.unsqueeze(-1)).sum(dim=-2)
     torch.testing.assert_close(y.float(), ref.float(), rtol=1e-4, atol=1e-4)
 

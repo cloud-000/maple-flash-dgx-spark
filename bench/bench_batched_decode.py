@@ -239,7 +239,11 @@ def report(model, tokenizer, max_tokens: int) -> None:
     batched kernels doing their job -- while the expert kernels go 9273 us at
     B=16 to 17722 at B=32, near-linear, because top-8 of 256 experts means a
     wider batch touches more distinct expert rows rather than reusing the same
-    ones. Grouping tokens by expert is the next lever, not more GEMV tuning.
+    ones. Grouped expert GEMV (tokens that share an expert share one code load)
+    is used at B>=32 and for prefill; B=2-16 stay on the per-slot kernel, which
+    is faster there. Sampled B=32 graphs measured ~1948 aggregate tok/s vs
+    ~1820 per-slot (~1.07x). Prefill-sized batches (128-256 tokens) see ~2x
+    on the expert kernels themselves.
     """
     print(f"\n  greedy decode, {max_tokens} tokens/row")
     _table(

@@ -42,18 +42,26 @@ class PackedTernaryLinear:
 
 
 class PackedTernaryExperts:
-    """Stacked experts ``[E, N, nwords]``; one fused launch over selected ids."""
+    """Stacked experts ``[E, N, nwords]``. Per-slot at small B; grouped at B>=32."""
 
     def __init__(self, packed_weight, row_alpha):
         self.packed_weight = packed_weight.contiguous()
         self.row_alpha = row_alpha
 
-    def forward(self, x, expert_ids):
-        y = ternary_expert_gemv(x, self.packed_weight, self.row_alpha, expert_ids)
+    def forward(self, x, expert_ids, slot_groups=None):
+        y = ternary_expert_gemv(
+            x,
+            self.packed_weight,
+            self.row_alpha,
+            expert_ids,
+            slot_groups=slot_groups,
+        )
         return add_adapter_delta(self, y, x, expert_ids=expert_ids)
 
-    def swiglu(self, x, expert_ids):
-        y = ternary_expert_swiglu(x, self.packed_weight, self.row_alpha, expert_ids)
+    def swiglu(self, x, expert_ids, slot_groups=None):
+        y = ternary_expert_swiglu(
+            x, self.packed_weight, self.row_alpha, expert_ids, slot_groups=slot_groups
+        )
         return add_adapter_delta(self, y, x, expert_ids=expert_ids)
 
     def down_sum(self, x, expert_ids, topk_weight, residual=None):

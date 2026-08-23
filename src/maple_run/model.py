@@ -24,6 +24,7 @@ from safetensors.torch import load_file
 from maple_run.kernels.decode_attn import apply_qkv_decode, decode_gqa_attn, gqa_splits
 from maple_run.kernels.fused_norm import add_rms_norm, moe_reduce_add, rms_norm
 from maple_run.kernels.router import router_topk
+from maple_run.kernels.ternary_expert import GROUPED_MIN_TOKENS, expert_slot_groups
 from maple_run.linear import (
     PackedRTN4Embedding,
     PackedRTN4Linear,
@@ -466,9 +467,11 @@ class MapleSparseMoeBlock:
         bsz, seq_len, hidden = hidden_states.shape
         x = hidden_states.reshape(-1, hidden)
         topk_idx, topk_weight = router_topk(x, self.gate_weight, self.top_k)
-
-        hidden_e = self.up_gate.swiglu(x, topk_idx)
-        expert_out = self.down(hidden_e, topk_idx)
+        groups = None
+        if x.shape[0] >= GROUPED_MIN_TOKENS:
+            groups = expert_slot_groups(topk_idx, self.up_gate.packed_weight.shape[0])
+        hidden_e = self.up_gate.swiglu(x, topk_idx, slot_groups=groups)
+        expert_out = self.down(hidden_e, topk_idx, slot_groups=groups)
         res = None if residual is None else residual.reshape(-1, hidden)
         y = moe_reduce_add(expert_out, topk_weight, residual=res)
         return y.view(bsz, seq_len, hidden)
