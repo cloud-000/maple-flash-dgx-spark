@@ -9,7 +9,9 @@ Transformers path is slow, and what a packed-kernel runtime has to do.
 haiku — the M4-class 169→218 jump, on this host. Default generate is still
 exact-head; do not regress it. `maple-run serve` is an OpenAI-compatible HTTP
 endpoint. Quality evals live in the sibling `bench` project and hit that
-endpoint (`bench eval --base-url … --model maple-2bit`). Do not re-convert unless the packed checkpoint is
+endpoint (`bench eval --base-url … --model maple-2bit`). **NextLat**
+(`maple-run nextlat` / `generate --nextlat`) is opt-in latent-dynamics
+speculative decode; packed Maple stays frozen. Do not re-convert unless the packed checkpoint is
 missing; FlashHead clusters are already attached (`--flash-head-only`).
 Do not start with a web search for Maple, MLX, or Spark bandwidth; read
 `docs/SOURCES.md` and `AGENTS.md` first — and read "How to measure on this host"
@@ -25,6 +27,7 @@ below before trusting any kernel benchmark.
 | 4 FlashHead | **Done.** `maple_run/flash_head.py` + indexed 4-bit GEMV. 4748 clusters / 512 probes attached on this host. Sampled **~487 tok/s** (256-tok bench) / **~489 tok/s** (700-tok haiku). Prefill stays on the exact head. CLI: `--flash-head`. Tests in `tests/test_flash_head.py`. |
 | 5 HTTP | **Done.** `maple-run serve` OpenAI `/v1/chat/completions` + `/v1/completions`. |
 | 6 Quality evals | **Moved to `../bench`.** OpenAI-compatible harness (`bench eval`) against `maple-run serve`. Dense-head protocol; full numbers still running. |
+| 7 NextLat | **Opt-in.** `maple_run/nextlat.py`: 3-layer residual MLP `p_ψ` (arXiv:2511.05963), Smooth-L1 + KL on frozen Maple hidden states, Leviathan self-speculative decode. CLI `maple-run nextlat` trains; `generate --nextlat` drafts. Default generate is still exact-head; do not regress it. Packed ternary weights stay frozen (no autograd through 2-bit GEMV). |
 
 Packed checkpoint on this host (gitignored, do not commit):
 
@@ -434,11 +437,39 @@ uv run --directory ../bench bench eval \
   --output runs/maple-2bit
 ```
 
+### Phase 7 — NextLat — **opt-in**
+
+Teoh et al. 2025 ([arXiv:2511.05963](https://arxiv.org/abs/2511.05963)).
+A 3-layer GELU MLP predicts the next final-layer hidden state from
+`(h_t, embed(x_{t+1}))` with a residual update. Maple's packed ternary body
+has no autograd, so only `p_ψ` is trained (frozen hidden states + Smooth-L1,
+optional KL through a dequantized frozen `lm_head`). Joint transformer
+finetuning is out of scope until there is a differentiable packed path.
+
+```bash
+uv run maple-run nextlat-synth --model checkpoints/maple-2bit \
+  --prompts HuggingFaceH4/ultrachat_200k --split train_sft --limit 2000 \
+  -o nextlat/data/onpolicy.jsonl --batch-size 8
+uv run maple-run nextlat --model checkpoints/maple-2bit \
+  --data nextlat/data/onpolicy.jsonl --steps 200 --horizon 1
+uv run maple-run generate --model checkpoints/maple-2bit --nextlat \
+  --draft-len 5 --prompt "Write a haiku on groves" --max-tokens 128
+```
+
+Greedy NextLat must match greedy Maple (Leviathan reject-resamples the
+target argmax). Speculative decode is eager; CUDA graphs stay on the default
+path. `maple-run serve` does not use NextLat yet. On-policy dumps use the
+same sampled defaults as `generate` (T=1.0, top_p=0.95, top_k=20), exact
+head, no `--nextlat`; `--max-tokens` defaults to 256 so completions fill
+`--seq-len`. `nextlat/data/` is gitignored.
+
+Default generate is exact-head. Do not regress the ~368 tok/s path.
+
 ## Scaffold map
 
 | Path | Role |
 |---|---|
-| `src/maple_run/cli.py` | `convert` / `generate` / `serve` subcommands (`eval` points at `../bench`) |
+| `src/maple_run/cli.py` | `convert` / `generate` / `serve` / `nextlat` / `nextlat-synth` subcommands (`eval` points at `../bench`) |
 | `src/maple_run/server.py` | OpenAI-compatible HTTP (`/v1/chat/completions`) |
 | `src/maple_run/pack.py` | CPU ternarize + pack_2bit + 4-bit RTN |
 | `src/maple_run/convert.py` | Streaming HF → packed safetensors |
@@ -450,6 +481,10 @@ uv run --directory ../bench bench eval \
 | `src/maple_run/kernels/decode_attn.py` | q_len=1 QK-RMS/RoPE + GQA (loops seqlen/SWA) |
 | `src/maple_run/kernels/rtn4.py` | 4-bit RTN embedding + lm_head GEMV + indexed FlashHead GEMV |
 | `src/maple_run/flash_head.py` | Cluster attach (`generate_flash_head`) + decode FlashHead |
+| `src/maple_run/nextlat.py` | NextLat `p_ψ` MLP, loss, Leviathan speculative decode |
+| `src/maple_run/nextlat_train.py` | Frozen-Maple trainer for `p_ψ` |
+| `src/maple_run/nextlat_synth.py` | On-policy Maple completions → `nextlat/data/*.jsonl` |
+| `nextlat/generate_onpolicy.py` | Thin CLI shim for `nextlat-synth` |
 | `src/maple_run/linear.py` | PackedTernaryLinear / Experts / RTN4 |
 | `src/maple_run/model.py` | MapleForCausalLM packed forward |
 | `src/maple_run/generate.py` | Tokenizer + greedy/sampled decode + tok/s |
@@ -457,6 +492,7 @@ uv run --directory ../bench bench eval \
 | `tests/test_eval_moved.py` | CLI `eval` points at the `bench` project |
 | `tests/test_bench.py` | Sampled decode speed (`pytest --bench`); FlashHead when attached |
 | `tests/test_flash_head.py` | Clustering, exact-when-all-probes, prefill stays exact |
+| `tests/test_nextlat.py` | Dynamics residual, NextLat loss, greedy speculative ≡ greedy Maple |
 | `tests/test_server.py` | OpenAI request parsing, CLI `serve` flags, fake-engine HTTP |
 | `docs/sources/mlx_lm_ternary.py` | **Authoritative packer** (DeepGrove, MIT) |
 | `docs/sources/mlx_lm_deepgrove_README.md` | MLX runtime README |

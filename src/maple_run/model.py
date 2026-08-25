@@ -854,7 +854,8 @@ class MapleForCausalLM:
         cache: KVCache | None = None,
         *,
         logits_to_keep: int = 1,
-    ) -> torch.Tensor:
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
         hidden = self.word_embeddings(input_ids).to(self.dtype)
@@ -885,8 +886,12 @@ class MapleForCausalLM:
             and hidden.shape[0] == 1
             and seq_len == 1
         ):
-            return self.lm_head_flash(hidden)
-        return self.lm_head(hidden)
+            logits = self.lm_head_flash(hidden)
+        else:
+            logits = self.lm_head(hidden)
+        if return_hidden:
+            return logits, hidden
+        return logits
 
     @torch.inference_mode()
     def generate(self, input_ids, max_tokens: int = 128):

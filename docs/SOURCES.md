@@ -95,3 +95,9 @@ DeepGrove reported dense-head scores on LCBv6 / AIME 2026 / HMMT 2026 / GPQA-D
   prompts/tests: https://github.com/LiveCodeBench/LiveCodeBench
 - Launch page (JS app; table is also on the HF model card image):
   https://deepgrove.ai/maple-preview
+
+## NextLat (opt-in speculative decode)
+
+- Paper: https://arxiv.org/abs/2511.05963
+- Official code: https://github.com/JaydenTeoh/NextLat
+  (`models/model_nextlat.py` is the `p_ψ` MLP + Algorithm 1 loss)

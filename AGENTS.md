@@ -34,6 +34,10 @@ hardware numbers. Vendored algorithm source is `docs/sources/mlx_lm_ternary.py`.
 5. **HTTP** (`maple_run/server.py`): **done.** `maple-run serve` is an
    OpenAI-compatible `/v1/chat/completions` endpoint. Same sampling flags as
    `generate` are CLI defaults; the request body may override them.
+6. **NextLat** (`maple_run/nextlat.py`): **opt-in.** Train `p_ψ` on frozen
+   Maple (`maple-run nextlat`), optional on-policy dumps via
+   `maple-run nextlat-synth` into `nextlat/data/`, then `--nextlat`
+   speculative decode. Do not regress the default exact-head generate path.
 
 Stop at the phase the user asked for. Do not skip packing tests to jump to a
 server.

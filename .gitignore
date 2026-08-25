@@ -28,6 +28,9 @@ docs/sources/
 tmp_ab_speed.py
 tmp
 
+# NextLat on-policy dumps
+nextlat/data/
+
 # AI
 .claude/
 .agents/

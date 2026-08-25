@@ -155,6 +155,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Directory of saved EGGROLL adapters (disables FlashHead)",
     )
+    generate.add_argument(
+        "--nextlat",
+        action="store_true",
+        help="Self-speculative decode with a trained NextLat p_ψ "
+        "(nextlat.safetensors next to the packed checkpoint)",
+    )
+    generate.add_argument(
+        "--draft-len",
+        type=int,
+        default=5,
+        help="NextLat draft tokens per verify round (default 5)",
+    )
     _add_sampling_args(generate)
 
     sub.add_parser(
@@ -336,6 +348,128 @@ def main(argv: list[str] | None = None) -> int:
         help="Max chars of prompt/text/reasoning per episode (default 2000; 0 omits them)",
     )
 
+    nextlat = sub.add_parser(
+        "nextlat",
+        help="Train NextLat latent dynamics p_ψ on frozen packed Maple",
+    )
+    nextlat.add_argument("--model", required=True, help="Packed checkpoint directory")
+    nextlat.add_argument(
+        "--data",
+        required=True,
+        help="Text file (one sequence per line) or JSONL with input_ids "
+        "or text/content/prompt",
+    )
+    nextlat.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Directory for nextlat.safetensors (default: --model)",
+    )
+    nextlat.add_argument("--steps", type=int, default=200, help="AdamW steps (default 200)")
+    nextlat.add_argument(
+        "--seq-len",
+        type=int,
+        default=256,
+        help="Truncate each sequence to this many tokens (default 256)",
+    )
+    nextlat.add_argument("--lr", type=float, default=1e-3, help="AdamW learning rate")
+    nextlat.add_argument(
+        "--horizon",
+        type=int,
+        default=1,
+        help="Multi-step unroll d (default 1; paper FineWeb-Edu used 1 or 2)",
+    )
+    nextlat.add_argument(
+        "--lambda-next-h",
+        type=float,
+        default=1.0,
+        help="Weight on Smooth-L1 next-hidden loss (default 1.0)",
+    )
+    nextlat.add_argument(
+        "--lambda-kl",
+        type=float,
+        default=1.0,
+        help="Weight on KL through the frozen lm_head (default 1.0)",
+    )
+    nextlat.add_argument(
+        "--mlp-hidden",
+        type=int,
+        default=None,
+        help="p_ψ MLP width (default: FineWeb-Edu ratio, 6528 at hidden=2048)",
+    )
+    nextlat.add_argument("--seed", type=int, default=0)
+    nextlat.add_argument(
+        "--max-sequences",
+        type=int,
+        default=None,
+        help="Cap the number of training sequences",
+    )
+
+    synth = sub.add_parser(
+        "nextlat-synth",
+        help="Generate Maple completions for NextLat on-policy jsonl",
+    )
+    synth.add_argument("--model", required=True, help="Packed checkpoint directory")
+    synth.add_argument(
+        "--prompts",
+        required=True,
+        help="Prompt jsonl, a text file, or a Hugging Face dataset id "
+        "(e.g. HuggingFaceH4/ultrachat_200k)",
+    )
+    synth.add_argument(
+        "-o",
+        "--output",
+        default="nextlat/data/onpolicy.jsonl",
+        help="Output jsonl (default nextlat/data/onpolicy.jsonl)",
+    )
+    synth.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Only the first N prompts (default: all)",
+    )
+    synth.add_argument(
+        "--max-tokens",
+        type=int,
+        default=256,
+        help="Max new tokens per prompt (default 256, to fill --seq-len 256)",
+    )
+    synth.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Match generate default (1.0). 0 is greedy",
+    )
+    synth.add_argument(
+        "--top-p",
+        type=float,
+        default=0.95,
+        help="Match generate default (0.95)",
+    )
+    synth.add_argument(
+        "--top-k",
+        type=int,
+        default=20,
+        help="Match generate default (20)",
+    )
+    synth.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Base CUDA seed; prompt i uses seed+i (batch uses seed of first row)",
+    )
+    synth.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Decode this many prompts together (default 8; 1 is sequential)",
+    )
+    synth.add_argument(
+        "--split",
+        default=None,
+        help="HF dataset split (default: train_sft, then train)",
+    )
+
     args = parser.parse_args(argv)
     if args.cmd == "convert":
         if args.flash_head_only and args.flash_head:
@@ -369,6 +503,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "generate":
         _validate_sampling_args(parser, args)
+        if args.draft_len < 1:
+            parser.error("--draft-len must be >= 1")
         from maple_run.generate import generate
 
         generate(
@@ -381,6 +517,8 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             flash_head=args.flash_head,
             eggroll=args.eggroll,
+            nextlat=args.nextlat,
+            draft_len=args.draft_len,
         )
         return 0
     if args.cmd == "serve":
@@ -483,6 +621,58 @@ def main(argv: list[str] | None = None) -> int:
                 trace_chars=args.trace_chars,
                 **resolved,
             )
+        )
+        return 0
+    if args.cmd == "nextlat":
+        if args.steps < 1:
+            parser.error("--steps must be >= 1")
+        if args.seq_len < 3:
+            parser.error("--seq-len must be >= 3")
+        if args.lr <= 0:
+            parser.error("--lr must be > 0")
+        if args.horizon < 1:
+            parser.error("--horizon must be >= 1")
+        if args.mlp_hidden is not None and args.mlp_hidden < 1:
+            parser.error("--mlp-hidden must be >= 1")
+        if args.max_sequences is not None and args.max_sequences < 1:
+            parser.error("--max-sequences must be >= 1")
+        from maple_run.nextlat_train import train_nextlat
+
+        train_nextlat(
+            args.model,
+            args.data,
+            output=args.output,
+            steps=args.steps,
+            seq_len=args.seq_len,
+            lr=args.lr,
+            horizon=args.horizon,
+            lambda_next_h=args.lambda_next_h,
+            lambda_kl=args.lambda_kl,
+            mlp_hidden=args.mlp_hidden,
+            seed=args.seed,
+            max_sequences=args.max_sequences,
+        )
+        return 0
+    if args.cmd == "nextlat-synth":
+        _validate_sampling_args(parser, args)
+        if args.limit is not None and args.limit < 1:
+            parser.error("--limit must be >= 1")
+        if args.batch_size < 1:
+            parser.error("--batch-size must be >= 1")
+        from maple_run.nextlat_synth import synthesize_onpolicy
+
+        synthesize_onpolicy(
+            args.model,
+            args.prompts,
+            output=args.output,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            seed=args.seed,
+            limit=args.limit,
+            batch_size=args.batch_size,
+            split=args.split,
         )
         return 0
     parser.error(f"unknown command {args.cmd}")
