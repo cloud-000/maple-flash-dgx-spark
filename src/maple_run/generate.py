@@ -1122,6 +1122,8 @@ def run_generate(
     use_graph: bool | None = None,
     nextlat=None,
     draft_len: int = 5,
+    stop_ids: set[int] | None = None,
+    early_stop: bool = True,
 ) -> GenerateResult:
     """Decode from ``input_ids`` on an already-loaded packed model."""
     def emit(msg: str) -> None:
@@ -1153,7 +1155,8 @@ def run_generate(
             f"({'fused' if sampler_ws is not None else 'torch'} sampler)"
         )
 
-    stop_ids = stop_token_ids(model, tokenizer)
+    if stop_ids is None:
+        stop_ids = stop_token_ids(model, tokenizer)
     decoder = CompletionDecoder(
         tokenizer,
         in_think=prompt_in_think(tokenizer, input_ids),
@@ -1275,11 +1278,12 @@ def run_generate(
             new_calls = decoder.take_new_tool_calls()
             if new_calls and on_tool_calls is not None:
                 on_tool_calls(new_calls)
-            if stop_ids and next_id in stop_ids:
-                hit_eos = True
-                break
-            if decoder.should_stop:
-                break
+            if early_stop:
+                if stop_ids and next_id in stop_ids:
+                    hit_eos = True
+                    break
+                if decoder.should_stop:
+                    break
         torch.cuda.synchronize()
         t_end = time.perf_counter()
 

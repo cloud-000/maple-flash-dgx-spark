@@ -6,9 +6,11 @@
 
     Decode (batch=1) weight loads use ``evict_first`` so a layer's codes do not
     occupy L2 after the GEMV; activations stay ``evict_last``. Prefill reuses the
-    same tiles across tokens, so those hints stay off. In-model QKV/O otherwise
-    lands at ~131 GB/s against ~175 isolated because the next kernel's weights
-    fight the last.
+    same tiles across tokens, so those hints stay off. Split ablation (skip QKV
+    vs skip O before CUDA-graph capture): in-model QKV is 136 GB/s vs 164
+    isolated (fused RMS on), O is 148 vs 158. Both ~55% of the 250 GB/s this
+    host delivers. ``BLOCK_N=2`` / 1 warp / ``BLOCK_K_WORDS=64`` won a
+    round-robin in-model sweep; 2–4 warps and ``BLOCK_K_WORDS=32`` all lost.
 
 Packing (see ``maple_run.pack``): 16 LSB-first 2-bit codes per uint32, codes
 ``{0, 1, 2}`` = ``{−1, 0, +1} + 1``.
@@ -16,11 +18,110 @@ Packing (see ``maple_run.pack``): 16 LSB-first 2-bit codes per uint32, codes
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 import triton
 import triton.language as tl
 
 _CODES_PER_WORD = 16
+
+# Decode-ablation hook. Default generate leaves both None. QKV always passes
+# ``rms_weight``; O never does, so skip can split them without a second kernel.
+# Apply *before* CUDA-graph capture: the graph bakes in whether the GEMV launches.
+GEMV_SKIP_QKV = "qkv"
+GEMV_SKIP_O = "o"
+GEMV_SKIP_BOTH = "both"
+GEMV_RMS_STRIP = "strip"
+GEMV_RMS_DUMMY = "dummy"
+
+_gemv_skip: str | None = None
+_gemv_rms_mode: str | None = None
+# batch=1 only: (BLOCK_N, BLOCK_K_WORDS, BLOCK_B, warps, stages). None = tuned default.
+_gemv_decode_launch: tuple[int, int, int, int, int] | None = None
+_noop_bufs: dict[tuple, torch.Tensor] = {}
+_dummy_rms: dict[tuple, torch.Tensor] = {}
+
+
+def configure_gemv_ablation(
+    *, skip: str | None = None, rms: str | None = None
+) -> None:
+    """No-op / RMS-path override for in-model QKV vs O timing.
+
+    ``skip``:
+        ``None`` run both; ``qkv`` skip when ``rms_weight is not None``;
+        ``o`` skip when ``rms_weight is None``; ``both`` always skip.
+        A skip returns a memoized zeros buffer of the right shape — no code
+        traffic. Downstream still runs.
+    ``rms``:
+        ``None`` leave the caller; ``strip`` drop ``rms_weight`` (QKV without
+        the fused norm); ``dummy`` inject ones when the caller omitted it
+        (O on the fused path). Skip is decided from the *caller's* rms, so
+        these two knobs do not confuse each other.
+    """
+    global _gemv_skip, _gemv_rms_mode
+    allowed_skip = {None, GEMV_SKIP_QKV, GEMV_SKIP_O, GEMV_SKIP_BOTH}
+    allowed_rms = {None, GEMV_RMS_STRIP, GEMV_RMS_DUMMY}
+    if skip not in allowed_skip:
+        raise ValueError(f"skip must be one of {sorted(s or 'None' for s in allowed_skip)}, got {skip!r}")
+    if rms not in allowed_rms:
+        raise ValueError(f"rms must be one of {sorted(s or 'None' for s in allowed_rms)}, got {rms!r}")
+    _gemv_skip = skip
+    _gemv_rms_mode = rms
+    _noop_bufs.clear()
+    _dummy_rms.clear()
+
+
+def configure_gemv_decode_launch(
+    meta: tuple[int, int, int, int, int] | None = None,
+) -> None:
+    """Override batch-1 ``_gemv_launch_meta``. ``None`` restores the tuned default.
+
+    Set before CUDA-graph capture. Prefill (batch>1) is unchanged.
+    """
+    global _gemv_decode_launch
+    if meta is not None and len(meta) != 5:
+        raise ValueError(f"decode launch must be (BLOCK_N, BLOCK_K_WORDS, BLOCK_B, warps, stages), got {meta!r}")
+    _gemv_decode_launch = meta
+
+
+@contextmanager
+def gemv_ablation(*, skip: str | None = None, rms: str | None = None):
+    prev_skip, prev_rms = _gemv_skip, _gemv_rms_mode
+    configure_gemv_ablation(skip=skip, rms=rms)
+    try:
+        yield
+    finally:
+        configure_gemv_ablation(skip=prev_skip, rms=prev_rms)
+
+
+def _should_skip(rms_weight: torch.Tensor | None) -> bool:
+    if _gemv_skip is None:
+        return False
+    if _gemv_skip == GEMV_SKIP_BOTH:
+        return True
+    if _gemv_skip == GEMV_SKIP_QKV:
+        return rms_weight is not None
+    return rms_weight is None
+
+
+def _noop_output(x: torch.Tensor, n_out: int) -> torch.Tensor:
+    leading = tuple(x.shape[:-1])
+    key = (leading, n_out, x.dtype, x.device)
+    buf = _noop_bufs.get(key)
+    if buf is None:
+        buf = torch.zeros(*leading, n_out, device=x.device, dtype=x.dtype)
+        _noop_bufs[key] = buf
+    return buf
+
+
+def _dummy_rms_weight(k_in: int, device: torch.device) -> torch.Tensor:
+    key = (k_in, device)
+    buf = _dummy_rms.get(key)
+    if buf is None:
+        buf = torch.ones(k_in, device=device, dtype=torch.float32)
+        _dummy_rms[key] = buf
+    return buf
 
 
 def _gemv_launch_meta(nwords: int, batch: int) -> tuple[int, int, int, int, int]:
@@ -56,6 +157,8 @@ def _gemv_launch_meta(nwords: int, batch: int) -> tuple[int, int, int, int, int]
     kernel's rounding exactly rather than merely inside a bfloat16 ulp.
     """
     if batch == 1:
+        if _gemv_decode_launch is not None:
+            return _gemv_decode_launch
         if nwords >= 64:
             return 2, 64, 1, 1, 3
         if nwords >= 32:
@@ -316,6 +419,12 @@ def ternary_gemv(
     leading = x.shape[:-1]
     batch = int(x.numel() // k_in)
     x_mat = x.reshape(batch, k_in)
+    if _should_skip(rms_weight):
+        return _noop_output(x, n_out)
+    if _gemv_rms_mode == GEMV_RMS_STRIP:
+        rms_weight = None
+    elif _gemv_rms_mode == GEMV_RMS_DUMMY and rms_weight is None:
+        rms_weight = _dummy_rms_weight(k_in, x.device)
     y = torch.empty(batch, n_out, device=x.device, dtype=x.dtype)
     has_rms = rms_weight is not None
     rms_w = x_mat if rms_weight is None else rms_weight.reshape(-1)

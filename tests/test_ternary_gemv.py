@@ -326,3 +326,83 @@ def test_batched_reads_each_code_tile_once_per_cta():
 
     t1, t32 = timed(1), timed(32)
     assert t32 < 8 * t1, f"batch 32 took {t32/t1:.1f}x batch 1; weights not shared"
+
+
+@cuda
+def test_gemv_skip_splits_qkv_from_o_by_rms_weight():
+    """QKV always passes rms_weight; O never does. Skip must not touch codes."""
+    from maple_run.kernels.ternary_gemv import gemv_ablation, ternary_gemv
+
+    rng = np.random.default_rng(21)
+    packed, alpha = ternarize(rng.standard_normal((64, 128)).astype(np.float32))
+    packed_t, alpha_t = _to_cuda_packed(packed, alpha)
+    x = torch.from_numpy(rng.standard_normal((1, 128)).astype(np.float32)).cuda()
+    rms = torch.from_numpy(rng.standard_normal(128).astype(np.float32)).cuda()
+
+    y_qkv = ternary_gemv(x, packed_t, alpha_t, rms_weight=rms)
+    y_o = ternary_gemv(x, packed_t, alpha_t)
+    packed_t.fill_(0)
+
+    with gemv_ablation(skip="qkv"):
+        skip_qkv = ternary_gemv(x, packed_t, alpha_t, rms_weight=rms)
+        still_o = ternary_gemv(x, packed_t, alpha_t)
+    with gemv_ablation(skip="o"):
+        still_qkv = ternary_gemv(x, packed_t, alpha_t, rms_weight=rms)
+        skip_o = ternary_gemv(x, packed_t, alpha_t)
+    with gemv_ablation(skip="both"):
+        skip_both_q = ternary_gemv(x, packed_t, alpha_t, rms_weight=rms)
+        skip_both_o = ternary_gemv(x, packed_t, alpha_t)
+
+    zeros = torch.zeros_like(y_qkv)
+    assert torch.equal(skip_qkv, zeros)
+    assert torch.equal(skip_o, zeros)
+    assert torch.equal(skip_both_q, zeros) and torch.equal(skip_both_o, zeros)
+    # fill_(0) is code 0 = ternary −1, so a skip-miss still launches and is not zeros.
+    assert not torch.equal(still_o, zeros)
+    assert not torch.equal(still_qkv, zeros)
+    assert not torch.equal(y_qkv, zeros)
+    assert not torch.equal(y_o, zeros)
+
+
+@cuda
+def test_gemv_rms_strip_and_dummy_take_the_fused_path():
+    from maple_run.kernels.ternary_gemv import gemv_ablation, ternary_gemv
+
+    rng = np.random.default_rng(22)
+    packed, alpha = ternarize(rng.standard_normal((64, 128)).astype(np.float32))
+    packed_t, alpha_t = _to_cuda_packed(packed, alpha)
+    x = torch.from_numpy(rng.standard_normal((1, 128)).astype(np.float32)).cuda()
+    rms = torch.from_numpy(rng.standard_normal(128).astype(np.float32)).cuda() + 0.5
+
+    y_qkv = ternary_gemv(x, packed_t, alpha_t, rms_weight=rms)
+    y_qkv_bare = ternary_gemv(x, packed_t, alpha_t)
+    y_o = ternary_gemv(x, packed_t, alpha_t)
+    with gemv_ablation(rms="strip"):
+        y_strip = ternary_gemv(x, packed_t, alpha_t, rms_weight=rms)
+    with gemv_ablation(rms="dummy"):
+        y_dummy = ternary_gemv(x, packed_t, alpha_t)
+
+    torch.testing.assert_close(y_strip, y_qkv_bare, rtol=1e-5, atol=1e-5)
+    assert not torch.allclose(y_qkv, y_qkv_bare, rtol=1e-3, atol=1e-3)
+    # Dummy ones still RMS-normalizes x, so O is not the bare GEMV.
+    assert not torch.allclose(y_dummy, y_o, rtol=1e-3, atol=1e-3)
+    ones = torch.ones(128, device="cuda", dtype=torch.float32)
+    y_ones = ternary_gemv(x, packed_t, alpha_t, rms_weight=ones)
+    torch.testing.assert_close(y_dummy, y_ones, rtol=1e-5, atol=1e-5)
+
+
+def test_gemv_decode_launch_override_is_batch1_only():
+    from maple_run.kernels.ternary_gemv import (
+        _gemv_launch_meta,
+        configure_gemv_decode_launch,
+    )
+
+    default = _gemv_launch_meta(128, 1)
+    batched = _gemv_launch_meta(128, 8)
+    configure_gemv_decode_launch((2, 32, 1, 4, 3))
+    try:
+        assert _gemv_launch_meta(128, 1) == (2, 32, 1, 4, 3)
+        assert _gemv_launch_meta(128, 8) == batched
+    finally:
+        configure_gemv_decode_launch(None)
+    assert _gemv_launch_meta(128, 1) == default

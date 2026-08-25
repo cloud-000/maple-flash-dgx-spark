@@ -12,22 +12,22 @@ endpoint. Quality evals live in the sibling `bench` project and hit that
 endpoint (`bench eval --base-url … --model maple-2bit`). **NextLat**
 (`maple-run nextlat` / `generate --nextlat`) is opt-in latent-dynamics
 speculative decode; packed Maple stays frozen. Do not re-convert unless the packed checkpoint is
-missing; FlashHead clusters are already attached (`--flash-head-only`).
+missing; FlashHead clusters are already attached (`--flash-head-only`). Next Lat is slower, not working for now.
 Do not start with a web search for Maple, MLX, or Spark bandwidth; read
 `docs/SOURCES.md` and `AGENTS.md` first — and read "How to measure on this host"
 below before trusting any kernel benchmark.
 
 ## Status (2026-08-17)
 
-| Phase | State |
-|---|---|
-| 1 Pack / convert | **Done.** NumPy `ternarize` / `pack_2bit` / 4-bit RTN; streaming converter; tests in `tests/test_pack.py` and `tests/test_convert.py`. |
-| 2 Packed GEMV kernel | **Done.** Triton packed GEMV in `maple_run/kernels/ternary_gemv.py`; never unpacks to dense bf16. Tests in `tests/test_ternary_gemv.py`. |
-| 3 Model decode | **Done, fused, and tuned twice.** Packed forward + fused RMS/QKV/SwiGLU/decode attn + fused router + fused sampler. Exact-head sampled **~368 tok/s** on the 256-tok bench, **~364 tok/s** on 700-tok haiku. CUDA graphs used when replay matches eager sampled ids. **Default generate path; do not regress.** |
-| 4 FlashHead | **Done.** `maple_run/flash_head.py` + indexed 4-bit GEMV. 4748 clusters / 512 probes attached on this host. Sampled **~487 tok/s** (256-tok bench) / **~489 tok/s** (700-tok haiku). Prefill stays on the exact head. CLI: `--flash-head`. Tests in `tests/test_flash_head.py`. |
-| 5 HTTP | **Done.** `maple-run serve` OpenAI `/v1/chat/completions` + `/v1/completions`. |
-| 6 Quality evals | **Moved to `../bench`.** OpenAI-compatible harness (`bench eval`) against `maple-run serve`. Dense-head protocol; full numbers still running. |
-| 7 NextLat | **Opt-in.** `maple_run/nextlat.py`: 3-layer residual MLP `p_ψ` (arXiv:2511.05963), Smooth-L1 + KL on frozen Maple hidden states, Leviathan self-speculative decode. CLI `maple-run nextlat` trains; `generate --nextlat` drafts. Default generate is still exact-head; do not regress it. Packed ternary weights stay frozen (no autograd through 2-bit GEMV). |
+| Phase                | State                                                                                                                                                                                                                                                                                                                                                          |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 Pack / convert     | **Done.** NumPy `ternarize` / `pack_2bit` / 4-bit RTN; streaming converter; tests in `tests/test_pack.py` and `tests/test_convert.py`.                                                                                                                                                                                                                         |
+| 2 Packed GEMV kernel | **Done.** Triton packed GEMV in `maple_run/kernels/ternary_gemv.py`; never unpacks to dense bf16. Tests in `tests/test_ternary_gemv.py`.                                                                                                                                                                                                                       |
+| 3 Model decode       | **Done, fused, and tuned twice.** Packed forward + fused RMS/QKV/SwiGLU/decode attn + fused router + fused sampler. Exact-head sampled **~368 tok/s** on the 256-tok bench, **~364 tok/s** on 700-tok haiku. CUDA graphs used when replay matches eager sampled ids. **Default generate path; do not regress.**                                                |
+| 4 FlashHead          | **Done.** `maple_run/flash_head.py` + indexed 4-bit GEMV. 4748 clusters / 512 probes attached on this host. Sampled **~487 tok/s** (256-tok bench) / **~489 tok/s** (700-tok haiku). Prefill stays on the exact head. CLI: `--flash-head`. Tests in `tests/test_flash_head.py`.                                                                                |
+| 5 HTTP               | **Done.** `maple-run serve` OpenAI `/v1/chat/completions` + `/v1/completions`.                                                                                                                                                                                                                                                                                 |
+| 6 Quality evals      | **Moved to `../bench`.** OpenAI-compatible harness (`bench eval`) against `maple-run serve`. Dense-head protocol; full numbers still running.                                                                                                                                                                                                                  |
+| 7 NextLat            | **Opt-in.** `maple_run/nextlat.py`: 3-layer residual MLP `p_ψ` (arXiv:2511.05963), Smooth-L1 + KL on frozen Maple hidden states, Leviathan self-speculative decode. CLI `maple-run nextlat` trains; `generate --nextlat` drafts. Default generate is still exact-head; do not regress it. Packed ternary weights stay frozen (no autograd through 2-bit GEMV). |
 
 Packed checkpoint on this host (gitignored, do not commit):
 
@@ -62,7 +62,7 @@ file as dense `nn.Linear` weights. Convert streams safetensors with NumPy.
 Run Maple-Preview on this DGX Spark at Mac-like decode speed: **keep weights
 packed at runtime**. High-level job:
 
-1. Pack the HF bf16 dump into 2-bit codes + per-row `α`.  ← done
+1. Pack the HF bf16 dump into 2-bit codes + per-row `α`. ← done
 2. Write kernels that read that layout and never unpack to bf16.
 
 Python + uv is the shell. Speed is the kernels.
@@ -110,11 +110,11 @@ DeepGrove's converter (vendored at `docs/sources/mlx_lm_ternary.py`):
 `config.json` has `"dtype": "bfloat16"` and `"quantize": true`. That is compute
 container vs “these linears are ternary-valued.”
 
-| Artifact | Size | What |
-|---|---|---|
-| `deepgrove/maple-preview` | ~40 GB (`total_size` 40428060672 in the HF index) | Unpacked QAT weights, Transformers-shaped |
-| MLX packed (`maple-2bit-mlx` / convert output) | ~5.31 GB | 2-bit codes + `row_alpha`; 4-bit head/embed |
-| Information per ternary weight | `log2(3) ≈ 1.58` bits | Storage is 2 bits/code |
+| Artifact                                       | Size                                              | What                                        |
+| ---------------------------------------------- | ------------------------------------------------- | ------------------------------------------- |
+| `deepgrove/maple-preview`                      | ~40 GB (`total_size` 40428060672 in the HF index) | Unpacked QAT weights, Transformers-shaped   |
+| MLX packed (`maple-2bit-mlx` / convert output) | ~5.31 GB                                          | 2-bit codes + `row_alpha`; 4-bit head/embed |
+| Information per ternary weight                 | `log2(3) ≈ 1.58` bits                             | Storage is 2 bits/code                      |
 
 Not every tensor is ternary (from the converter):
 
@@ -131,11 +131,11 @@ Transformers file. User measured ~220 tok/s on an M5 Air with that MLX stack.
 
 Decode is memory-bound: tok/s ≈ bandwidth / bytes per token.
 
-| Machine | Bandwidth | Source |
-|---|---|---|
-| DGX Spark GB10 | **273 GB/s** LPDDR5x, 128 GB | NVIDIA DGX Spark spec |
-| M4 Mini (base) | ~120 GB/s | Apple M4 |
-| M5 Air (base M5) | **153.6 GB/s** | Apple M5, LPDDR5X 9600 |
+| Machine          | Bandwidth                    | Source                 |
+| ---------------- | ---------------------------- | ---------------------- |
+| DGX Spark GB10   | **273 GB/s** LPDDR5x, 128 GB | NVIDIA DGX Spark spec  |
+| M4 Mini (base)   | ~120 GB/s                    | Apple M4               |
+| M5 Air (base M5) | **153.6 GB/s**               | Apple M5, LPDDR5X 9600 |
 
 Spark has **more** bandwidth than the Air. The HF CUDA path still loses because
 it is a different program:
@@ -281,26 +281,26 @@ softmax/top-k/nucleus/multinomial and often stops at ~38 tok, which inflates tok
 
 Measured on this GB10 host (2026-08-17), exact 4-bit head, no FlashHead:
 
-| | |
-|---|---|
-| Packed weight traffic | **417 MB/token** (was 462; router + RTN scales are bf16 now) |
-| Unpacked bf16 traffic (same active tensors) | **2359 MB/token** (~2.3 GB handoff estimate) |
-| **Achievable** read bandwidth, measured | **~250 GB/s** — see "273 GB/s is not reachable" below |
-| Bandwidth ceiling at that rate | `250 / 0.417 ≈ 600` tok/s if fully fused |
-| M4-scaled target, spec bandwidth | `169 × 273 / 120 ≈ 386` tok/s |
-| M4-scaled target, **achievable** bandwidth | `169 × 250 / 120 ≈ 352` tok/s |
-| Decode **sampled** T=1.0 top-p=0.95 top-k=20 (haiku, 256 tok bench) | **~368 tok/s** (was 254) |
-| Decode **sampled** T=1.0 top-p=0.95 top-k=20 (haiku, 700 tok) | **~364 tok/s** (was 234) |
-| Decode greedy France 42 tok EOS (not a speed bench) | ~390 tok/s; still prints Paris |
+|                                                                     |                                                              |
+| ------------------------------------------------------------------- | ------------------------------------------------------------ |
+| Packed weight traffic                                               | **417 MB/token** (was 462; router + RTN scales are bf16 now) |
+| Unpacked bf16 traffic (same active tensors)                         | **2359 MB/token** (~2.3 GB handoff estimate)                 |
+| **Achievable** read bandwidth, measured                             | **~250 GB/s** — see "273 GB/s is not reachable" below        |
+| Bandwidth ceiling at that rate                                      | `250 / 0.417 ≈ 600` tok/s if fully fused                     |
+| M4-scaled target, spec bandwidth                                    | `169 × 273 / 120 ≈ 386` tok/s                                |
+| M4-scaled target, **achievable** bandwidth                          | `169 × 250 / 120 ≈ 352` tok/s                                |
+| Decode **sampled** T=1.0 top-p=0.95 top-k=20 (haiku, 256 tok bench) | **~368 tok/s** (was 254)                                     |
+| Decode **sampled** T=1.0 top-p=0.95 top-k=20 (haiku, 700 tok)       | **~364 tok/s** (was 234)                                     |
+| Decode greedy France 42 tok EOS (not a speed bench)                 | ~390 tok/s; still prints Paris                               |
 
 FlashHead (`--flash-head`), same host, clusters already attached:
 
-| | |
-|---|---|
-| Packed weight traffic | **267 MB/token** (centroids + 512×32 probed rows, not the 152 k head) |
-| Decode **sampled** (haiku, 256 tok bench) | **~487 tok/s** |
-| Decode **sampled** (haiku, 700 tok) | **~489 tok/s** |
-| Decode greedy France (not a speed bench) | still prints Paris; force tokens EOS / `</think>` / `<|im_end|>` |
+|                                           |                                                                       |
+| ----------------------------------------- | --------------------------------------------------------------------- |
+| Packed weight traffic                     | **267 MB/token** (centroids + 512×32 probed rows, not the 152 k head) |
+| Decode **sampled** (haiku, 256 tok bench) | **~487 tok/s**                                                        |
+| Decode **sampled** (haiku, 700 tok)       | **~489 tok/s**                                                        |
+| Decode greedy France (not a speed bench)  | still prints Paris; force tokens EOS / `</think>` / `<                | im_end | >`  |
 
 Default generate is exact-head. Do not regress the ~368 tok/s path. FlashHead
 is opt-in and approximate: greedy is exact when the true argmax is in a probed
@@ -326,15 +326,17 @@ but it is not what "Spark at M4 efficiency" works out to.
 By ablation (replace one kernel with a memoized no-op and re-time full decode --
 the profiler's per-kernel self time over-attributes by ~35% here):
 
-| Kernel | us/token | of which | % of achievable peak |
-|---|---|---|---|
-| `rtn4_gemv` lm_head | ~720-825 | 175 MB | ~85% |
-| `ternary_gemv` QKV + O | ~350-480 | 63 MB | ~55% |
-| `ternary_expert_swiglu` | ~365-460 | 101 MB | ~85% |
-| `ternary_expert_gemv` down | ~290 | 50 MB | ~70% |
-| `router_topk` (both launches) | ~120-200 | 25 MB | — |
-| fused sampler (outside the graph) | ~37 | — | — |
-| `add_rms_norm` / `moe_reduce_add` | ~11 / ~19 | — | — |
+| Kernel                            | us/token  | of which | % of achievable peak |
+| --------------------------------- | --------- | -------- | -------------------- |
+| `rtn4_gemv` lm_head               | ~720-825  | 175 MB   | ~85%                 |
+| `ternary_gemv` QKV                | 277       | 37.7 MB  | 54%                  |
+| `ternary_gemv` O                  | 170       | 25.2 MB  | 59%                  |
+| `ternary_gemv` QKV + O (lumped)   | 457       | 62.9 MB  | 55%                  |
+| `ternary_expert_swiglu`           | ~365-460  | 101 MB   | ~85%                 |
+| `ternary_expert_gemv` down        | ~290      | 50 MB    | ~70%                 |
+| `router_topk` (both launches)     | ~120-200  | 25 MB    | —                    |
+| fused sampler (outside the graph) | ~37       | —        | —                    |
+| `add_rms_norm` / `moe_reduce_add` | ~11 / ~19 | —        | —                    |
 
 Ranges are run-to-run spread, not uncertainty in the method; see the
 measurement notes below.
@@ -358,7 +360,7 @@ This box misled three separate rounds of tuning. All four traps are real:
    launch reads a different layer. Rotate over enough distinct buffers to pass
    ~75 MB; past that the number stops moving.
 3. **Back-to-back launches in a sweep overlap; the model's do not** — but this
-   turned out to cost only ~0.5 us/launch, so it is *not* where the gap is. The
+   turned out to cost only ~0.5 us/launch, so it is _not_ where the gap is. The
    gap was L2 (trap 2) plus program count.
 4. **Run-to-run spread is ~5%, and a long sweep drifts.** Timing configs one
    after another reliably favours whichever ran first. Round-robin the
@@ -369,14 +371,37 @@ The honest tools, in order of trust: full sampled decode timed several times
 (`tests/test_bench.py --bench`), ablation against full decode, round-robin A/B
 of launch configs, L2-cold microbench, and last a plain microbench.
 
+Split QKV vs O with `bench/ablate_qkv_o.py` (sampled, graphs on, stop tokens
+off, `--max-tokens 256`; garbage logits EOS early and fake tok/s). Skip is a
+memoized no-op inside `ternary_gemv`, keyed off `rms_weight is not None`
+(QKV) vs `None` (O), applied **before** CUDA-graph capture. Isolated cold
+QKV/O in that script rotates ≥75 MB inside a CUDA graph; do not use a 1–4 MB
+hot-L2 microbench as the 175 GB/s-class reference.
+
+Measured 2026-08-25, five round-robin trials, median, peak = 250 GB/s:
+
+| Kernel | us/token | bytes | in-model | isolated (graph, ≥75 MB) |
+| ------ | -------- | ----- | -------- | ------------------------ |
+| QKV (fused RMS) | 277 | 37.7 MB | 136 GB/s (54%) | 164 GB/s |
+| O (no RMS) | 170 | 25.2 MB | 148 GB/s (59%) | 158 GB/s |
+| QKV+O | 457 | 62.9 MB | 138 GB/s (55%) | — |
+
+RMS tax in situ: ripping RMS off QKV saves ~88 us/token (do **not** unfuse
+into a serial `rms_norm` pre-pass — that already lost ~30 GB/s). Dummy RMS on
+O is noise (−5 us). Round-robin launch sweep in full sampled decode with RMS
+**on**: default `BLOCK_N=2 / BLOCK_K_WORDS=64 / 1 warp / 3 stages` wins;
+`BLOCK_K_WORDS=32` +52 us, 2 warps +81 us, 4 warps +136 us. Default generate
+tiles stay put.
+
 ### Open issues (next session: more body-kernel speed)
 
-1. **QKV/O is the weakest kernel**, ~55% of achievable against ~85% for the
-   lm_head and the expert SwiGLU. It is the only body GEMV with a fused input
-   RMSNorm. That norm no longer costs a pre-pass (rstd is a scalar and factors
-   out of the dot product, so sumsq accumulates inside the main loop), but the
-   O projection with no norm at all still runs materially better, so there may
-   be more here. Do not unpack ternary codes to get it.
+1. **QKV and O are both ~55% of 250 GB/s**, not a fused-RMS-only hole. QKV is
+   136 GB/s in-model vs 164 isolated; O is 148 vs 158. Dummy RMS does not move
+   O. More warps / a smaller K tile lost in the model. Next work is prefetch
+   O's 1.05 MB **during** `decode_gqa_attn`, not a QKV+attn+O megakernel and
+   not unpacking ternary codes. Re-run `bench/ablate_qkv_o.py` after any
+   kernel change (skip flag stays in `ternary_gemv`; default generate is still
+   exact-head sampled).
 2. **FlashHead is done** (phase 4). Exact-head `lm_head` remains ~30% of the
    token when `--flash-head` is off. Indexed probe GEMV must keep the same
    BLOCK_N=16 tiles as `rtn4_gemv`; a one-CTA-per-cluster launch was a wash.
@@ -467,36 +492,37 @@ Default generate is exact-head. Do not regress the ~368 tok/s path.
 
 ## Scaffold map
 
-| Path | Role |
-|---|---|
-| `src/maple_run/cli.py` | `convert` / `generate` / `serve` / `nextlat` / `nextlat-synth` subcommands (`eval` points at `../bench`) |
-| `src/maple_run/server.py` | OpenAI-compatible HTTP (`/v1/chat/completions`) |
-| `src/maple_run/pack.py` | CPU ternarize + pack_2bit + 4-bit RTN |
-| `src/maple_run/convert.py` | Streaming HF → packed safetensors |
-| `src/maple_run/kernels/ternary_gemv.py` | Packed GEMV (Triton); decode tiles pinned |
-| `src/maple_run/kernels/ternary_expert.py` | Fused indexed expert GEMV + SwiGLU |
-| `src/maple_run/kernels/fused_norm.py` | RMSNorm, add+RMSNorm, MoE reduce |
-| `src/maple_run/kernels/router.py` | Fused router GEMV + softmax + top-k + renorm |
-| `src/maple_run/kernels/sampler.py` | Fused top-k / temperature / nucleus sampling |
-| `src/maple_run/kernels/decode_attn.py` | q_len=1 QK-RMS/RoPE + GQA (loops seqlen/SWA) |
-| `src/maple_run/kernels/rtn4.py` | 4-bit RTN embedding + lm_head GEMV + indexed FlashHead GEMV |
-| `src/maple_run/flash_head.py` | Cluster attach (`generate_flash_head`) + decode FlashHead |
-| `src/maple_run/nextlat.py` | NextLat `p_ψ` MLP, loss, Leviathan speculative decode |
-| `src/maple_run/nextlat_train.py` | Frozen-Maple trainer for `p_ψ` |
-| `src/maple_run/nextlat_synth.py` | On-policy Maple completions → `nextlat/data/*.jsonl` |
-| `nextlat/generate_onpolicy.py` | Thin CLI shim for `nextlat-synth` |
-| `src/maple_run/linear.py` | PackedTernaryLinear / Experts / RTN4 |
-| `src/maple_run/model.py` | MapleForCausalLM packed forward |
-| `src/maple_run/generate.py` | Tokenizer + greedy/sampled decode + tok/s |
-| `src/maple_run/eval_score.py` | Boxed / AIME extractors used by EGGROLL rewards |
-| `tests/test_eval_moved.py` | CLI `eval` points at the `bench` project |
-| `tests/test_bench.py` | Sampled decode speed (`pytest --bench`); FlashHead when attached |
-| `tests/test_flash_head.py` | Clustering, exact-when-all-probes, prefill stays exact |
-| `tests/test_nextlat.py` | Dynamics residual, NextLat loss, greedy speculative ≡ greedy Maple |
-| `tests/test_server.py` | OpenAI request parsing, CLI `serve` flags, fake-engine HTTP |
-| `docs/sources/mlx_lm_ternary.py` | **Authoritative packer** (DeepGrove, MIT) |
-| `docs/sources/mlx_lm_deepgrove_README.md` | MLX runtime README |
-| `docs/sources/maple-preview-config.json` | HF `config.json` copy |
+| Path                                      | Role                                                                                                     |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `src/maple_run/cli.py`                    | `convert` / `generate` / `serve` / `nextlat` / `nextlat-synth` subcommands (`eval` points at `../bench`) |
+| `src/maple_run/server.py`                 | OpenAI-compatible HTTP (`/v1/chat/completions`)                                                          |
+| `src/maple_run/pack.py`                   | CPU ternarize + pack_2bit + 4-bit RTN                                                                    |
+| `src/maple_run/convert.py`                | Streaming HF → packed safetensors                                                                        |
+| `src/maple_run/kernels/ternary_gemv.py`   | Packed GEMV (Triton); decode tiles pinned; QKV/O skip flag for ablation     |
+| `bench/ablate_qkv_o.py`                   | Split QKV vs O no-op ablation + batch-1 launch sweep in full sampled decode |
+| `src/maple_run/kernels/ternary_expert.py` | Fused indexed expert GEMV + SwiGLU                                                                       |
+| `src/maple_run/kernels/fused_norm.py`     | RMSNorm, add+RMSNorm, MoE reduce                                                                         |
+| `src/maple_run/kernels/router.py`         | Fused router GEMV + softmax + top-k + renorm                                                             |
+| `src/maple_run/kernels/sampler.py`        | Fused top-k / temperature / nucleus sampling                                                             |
+| `src/maple_run/kernels/decode_attn.py`    | q_len=1 QK-RMS/RoPE + GQA (loops seqlen/SWA)                                                             |
+| `src/maple_run/kernels/rtn4.py`           | 4-bit RTN embedding + lm_head GEMV + indexed FlashHead GEMV                                              |
+| `src/maple_run/flash_head.py`             | Cluster attach (`generate_flash_head`) + decode FlashHead                                                |
+| `src/maple_run/nextlat.py`                | NextLat `p_ψ` MLP, loss, Leviathan speculative decode                                                    |
+| `src/maple_run/nextlat_train.py`          | Frozen-Maple trainer for `p_ψ`                                                                           |
+| `src/maple_run/nextlat_synth.py`          | On-policy Maple completions → `nextlat/data/*.jsonl`                                                     |
+| `nextlat/generate_onpolicy.py`            | Thin CLI shim for `nextlat-synth`                                                                        |
+| `src/maple_run/linear.py`                 | PackedTernaryLinear / Experts / RTN4                                                                     |
+| `src/maple_run/model.py`                  | MapleForCausalLM packed forward                                                                          |
+| `src/maple_run/generate.py`               | Tokenizer + greedy/sampled decode + tok/s                                                                |
+| `src/maple_run/eval_score.py`             | Boxed / AIME extractors used by EGGROLL rewards                                                          |
+| `tests/test_eval_moved.py`                | CLI `eval` points at the `bench` project                                                                 |
+| `tests/test_bench.py`                     | Sampled decode speed (`pytest --bench`); FlashHead when attached                                         |
+| `tests/test_flash_head.py`                | Clustering, exact-when-all-probes, prefill stays exact                                                   |
+| `tests/test_nextlat.py`                   | Dynamics residual, NextLat loss, greedy speculative ≡ greedy Maple                                       |
+| `tests/test_server.py`                    | OpenAI request parsing, CLI `serve` flags, fake-engine HTTP                                              |
+| `docs/sources/mlx_lm_ternary.py`          | **Authoritative packer** (DeepGrove, MIT)                                                                |
+| `docs/sources/mlx_lm_deepgrove_README.md` | MLX runtime README                                                                                       |
+| `docs/sources/maple-preview-config.json`  | HF `config.json` copy                                                                                    |
 
 ## Dependencies
 
