@@ -580,6 +580,116 @@ class CompletionDecoder:
         return self._think_text, self._content_text
 
 
+def _message_role(message: dict) -> str:
+    role = str(message.get("role") or "")
+    return "system" if role == "developer" else role
+
+
+def normalize_chat_messages(messages: list[dict]) -> list[dict]:
+    """Hoist ``system`` / ``developer`` to the front and merge into one block.
+
+    Maple's jinja only injects custom instructions into the tools/system header
+    when ``messages[0]`` is system. Agent clients often drop system on turn 2+ or
+    send user before system; merging fixes both without changing other turns.
+    """
+    system_parts: list[str] = []
+    rest: list[dict] = []
+    for message in messages:
+        if _message_role(message) == "system":
+            text = message_text(message.get("content"))
+            if text.strip():
+                system_parts.append(text)
+        else:
+            rest.append(message)
+    if not system_parts:
+        return list(messages)
+    merged = {"role": "system", "content": "\n\n".join(system_parts)}
+    return [merged, *rest]
+
+
+def _tool_function_name(tool: dict) -> str | None:
+    fn = tool.get("function")
+    if isinstance(fn, dict):
+        name = fn.get("name")
+        return str(name) if name else None
+    name = tool.get("name")
+    return str(name) if name else None
+
+
+def _stub_tool(name: str) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+
+def infer_tools_from_messages(messages: list[dict]) -> list[dict]:
+    """Minimal OpenAI tool stubs from assistant ``tool_calls`` already in history."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for message in messages:
+        if str(message.get("role")) != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(fn, dict):
+                fn = call if isinstance(call, dict) else {}
+            name = fn.get("name")
+            if not name:
+                continue
+            name = str(name)
+            if name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+    return [_stub_tool(name) for name in names]
+
+
+def merge_tools(
+    explicit: list | None, inferred: list | None
+) -> list[dict] | None:
+    """Union tool lists by name; explicit schemas win over history stubs."""
+    if not explicit and not inferred:
+        return None
+    by_name: dict[str, dict] = {}
+    for tool in inferred or []:
+        if not isinstance(tool, dict):
+            continue
+        name = _tool_function_name(tool)
+        if name:
+            by_name[name] = tool
+    for tool in explicit or []:
+        if not isinstance(tool, dict):
+            continue
+        name = _tool_function_name(tool)
+        if name:
+            by_name[name] = tool
+    return list(by_name.values()) if by_name else None
+
+
+def resolve_chat_tools(
+    messages: list[dict], tools: list | None
+) -> tuple[list[dict] | None, str | None]:
+    """Parse request tools, infer missing names from history, and merge."""
+    inferred = infer_tools_from_messages(messages)
+    merged = merge_tools(tools, inferred)
+    if merged is None:
+        return None, None
+    if not tools and inferred:
+        return merged, (
+            f"inferred {len(inferred)} tool(s) from history; "
+            "re-send tools for full schemas"
+        )
+    if tools and inferred and len(merged) > len(tools):
+        added = len(merged) - len(tools)
+        return merged, f"merged request tools with {added} name(s) from history"
+    return merged, None
+
+
 def _chat_message(message: dict) -> dict:
     """Keep tool_calls / reasoning / names; flatten multimodal content to text.
 
@@ -587,10 +697,7 @@ def _chat_message(message: dict) -> dict:
     reasoning + ``supportsDeveloperRole``. Maple's jinja only reads ``system``.
     """
     out = dict(message)
-    role = str(message["role"])
-    if role == "developer":
-        role = "system"
-    out["role"] = role
+    out["role"] = _message_role(message)
     out["content"] = message_text(message.get("content"))
     return out
 
@@ -607,7 +714,7 @@ def encode_messages(
 
     Passes ``tools`` and keeps ``tool_calls`` so agent turns match mlx-lm.
     """
-    cleaned = [_chat_message(m) for m in messages]
+    cleaned = [_chat_message(m) for m in normalize_chat_messages(messages)]
     if getattr(tokenizer, "chat_template", None):
         kwargs: dict = {
             "add_generation_prompt": True,
@@ -624,15 +731,38 @@ def encode_messages(
     )
 
 
-def describe_chat_prompt(tokenizer, input_ids: torch.Tensor, tools: list | None) -> str:
-    """One-line serve log: whether system/skills made it into the tokenized prompt."""
+def describe_chat_prompt(
+    tokenizer,
+    input_ids: torch.Tensor,
+    tools: list | None,
+    *,
+    tools_note: str | None = None,
+) -> str:
+    """One-line serve log: system/tools presence in the tokenized prompt."""
     ids = input_ids.reshape(-1)
     n = int(ids.numel())
+    text = tokenizer.decode(ids.reshape(-1).tolist(), skip_special_tokens=False)
+    system = "<|im_start|>system" in text
+    names = [_tool_function_name(t) for t in tools or []]
+    names = [name for name in names if name]
     head = tokenizer.decode(ids[: min(n, 96)].tolist(), skip_special_tokens=False)
     head = " ".join(head.split())
-    if len(head) > 160:
-        head = head[:160] + "…"
-    return f"Chat prompt {n} tok tools={len(tools or [])} head={head!r}"
+    if len(head) > 120:
+        head = head[:120] + "…"
+    parts = [
+        f"Chat prompt {n} tok",
+        f"system={system}",
+        f"tools={len(names)}",
+    ]
+    if names:
+        preview = ", ".join(names[:6])
+        if len(names) > 6:
+            preview += f", +{len(names) - 6} more"
+        parts.append(f"tool_names=[{preview}]")
+    if tools_note:
+        parts.append(f"({tools_note})")
+    parts.append(f"head={head!r}")
+    return " ".join(parts)
 
 
 def encode_prompt(tokenizer, prompt: str, device) -> torch.Tensor:

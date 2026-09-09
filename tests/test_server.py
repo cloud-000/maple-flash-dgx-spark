@@ -141,11 +141,18 @@ def test_apply_system_prompt_prepends_when_missing():
     out = apply_system_prompt({"system": "You are Bob"}, messages)
     assert out[0] == {"role": "system", "content": "You are Bob"}
     assert out[1]["role"] == "user"
-    kept = apply_system_prompt(
-        {"system": "ignored"},
-        [{"role": "developer", "content": "already here"}, {"role": "user", "content": "hi"}],
-    )
-    assert kept[0]["content"] == "already here"
+
+
+def test_apply_system_prompt_merges_with_existing_system():
+    messages = [
+        {"role": "system", "content": "already here"},
+        {"role": "user", "content": "hi"},
+    ]
+    out = apply_system_prompt({"system": "extra rules"}, messages)
+    assert out[0]["role"] == "system"
+    assert out[0]["content"] == "extra rules"
+    assert out[1]["role"] == "system"
+    assert out[2]["role"] == "user"
 
 
 def test_openai_response_shape():

@@ -37,6 +37,7 @@ from maple_run.generate import (
     load_packed,
     log_model_traffic,
     prompt_in_think,
+    resolve_chat_tools,
     resolve_max_tokens,
     sample_next,
     skip_decode_ids,
@@ -173,11 +174,9 @@ def parse_tools(body: dict) -> list | None:
 
 
 def apply_system_prompt(body: dict, messages: list[dict]) -> list[dict]:
-    """Honor a top-level ``system`` field if no system/developer message exists."""
+    """Merge a top-level ``system`` string into ``messages`` (OpenAI extensions)."""
     system = body.get("system")
-    if not isinstance(system, str) or not system:
-        return messages
-    if any(str(m.get("role")) in ("system", "developer") for m in messages):
+    if not isinstance(system, str) or not system.strip():
         return messages
     return [{"role": "system", "content": system}, *messages]
 
@@ -393,10 +392,16 @@ class PackedEngine:
     ) -> GenerateResult:
         if self.tokenizer is None:
             raise RuntimeError("PackedEngine.chat needs a tokenizer")
+        tools, tools_note = resolve_chat_tools(messages, tools)
         input_ids = encode_messages(
             self.tokenizer, messages, self.model.device, tools=tools
         )
-        print(describe_chat_prompt(self.tokenizer, input_ids, tools), flush=True)
+        print(
+            describe_chat_prompt(
+                self.tokenizer, input_ids, tools, tools_note=tools_note
+            ),
+            flush=True,
+        )
         return self._submit(
             input_ids, sampling, on_text, on_reasoning, on_tool_calls
         )
