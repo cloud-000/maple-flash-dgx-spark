@@ -4,15 +4,29 @@ These instructions apply to the entire repository.
 
 ## What this is
 
-`maple-run` is a uv Python project that will pack DeepGrove Maple-Preview's
-Hugging Face bf16 dump into 2-bit ternary codes and run packed CUDA/Triton
+`maple-run` is a uv Python project that packs DeepGrove Maple-Preview's
+Hugging Face bf16 dump into 2-bit ternary codes and runs packed CUDA/Triton
 kernels on DGX Spark (GB10, sm_121). It is a custom runtime, not a vLLM recipe.
 
-Read `docs/HANDOFF.md` before writing kernels, a converter, or a generate loop.
-Read `docs/SOURCES.md` before searching the web for Maple, MLX conversion, or
-hardware numbers. Vendored algorithm source is `docs/sources/mlx_lm_ternary.py`.
+## Documentation map
 
-## Choose the work from the handoff phases
+- `AGENTS.md` is the current operating guide and repository status summary.
+- `docs/FIDELITY.md` defines the A/B/C model representations, quantization
+  boundaries, fidelity methodology, known reference-loader pitfall, and
+  September 2026 baseline measurements. Read it before changing conversion,
+  packed model math, attention, routing, or the `fidelity` command.
+- `docs/SOURCES.md` lists local and upstream evidence. Read it before searching
+  the web for Maple, MLX conversion, or hardware numbers.
+- `docs/HANDOFF.md` is a historical implementation handoff and engineering
+  record. Its phase plan is complete; use it for design rationale, benchmark
+  history, and host-specific measurement notes, not as the current task queue.
+- `docs/sources/mlx_lm_ternary.py` is the vendored authoritative conversion
+  algorithm.
+
+## Current implementation status
+
+The original implementation phases are complete. Preserve the default exact
+head generate path and treat optional experimental paths separately.
 
 1. **Pack** (`maple_run/pack.py`, `maple_run/convert.py`): **done.** CPU NumPy
    port of DeepGrove `ternarize` / `_pack_2bit` plus streaming convert. Packed
@@ -34,13 +48,26 @@ hardware numbers. Vendored algorithm source is `docs/sources/mlx_lm_ternary.py`.
 5. **HTTP** (`maple_run/server.py`): **done.** `maple-run serve` is an
    OpenAI-compatible `/v1/chat/completions` endpoint. Same sampling flags as
    `generate` are CLI defaults; the request body may override them.
-6. **NextLat** (`maple_run/nextlat.py`): **opt-in.** Train `p_ψ` on frozen
+6. **NextLat** (`maple_run/nextlat.py`): **implemented but opt-in and
+   experimental.** Train `p_ψ` on frozen
    Maple (`maple-run nextlat`), optional on-policy dumps via
    `maple-run nextlat-synth` into `nextlat/data/`, then `--nextlat`
    speculative decode. Do not regress the default exact-head generate path.
 
-Stop at the phase the user asked for. Do not skip packing tests to jump to a
-server.
+Quality evaluations live in the sibling `bench` project rather than this
+repository.
+
+## Fidelity reference hierarchy
+
+- **A:** original dense bf16 Transformers. Use it to measure quantization
+  impact, after validating its tokenizer, attention layout, and RoPE state.
+- **B:** dense dequantized packed weights. This is the primary mathematical
+  reference for packed runtime correctness.
+- **C:** production packed `maple-run`. B-versus-C isolates kernel/fusion
+  behavior; A-versus-C also includes 4-bit embedding and LM-head quantization.
+
+Do not assume a dense Transformers forward is ground truth merely because it
+completes. See `docs/FIDELITY.md` for the reference RoPE incident and baseline.
 
 ## Environment
 
@@ -59,5 +86,5 @@ server.
 - Do not commit Hugging Face weight shards or packed checkpoints.
 - Do not expose tokens, `.env`, or credentials.
 - Prefer sources already in `docs/sources/` over new web searches.
-- `NotImplementedError` stubs are intentional; replace them in the matching
-  phase instead of deleting the module layout.
+- Preserve intentional `NotImplementedError` stubs unless the requested work
+  explicitly covers them; do not delete module layout as cleanup.

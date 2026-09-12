@@ -27,6 +27,7 @@ docs/sources/
 # tmp
 tmp_ab_speed.py
 tmp
+runs/
 
 # NextLat on-policy dumps
 nextlat/data/

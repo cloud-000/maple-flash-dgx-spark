@@ -1,8 +1,15 @@
-# Handoff: implement maple-run
+# Historical handoff and implementation record
 
-This document is for the **next session**. The previous session diagnosed why
-`vllm serve deepgrove/maple-preview` failed on Spark, why the Hugging Face CUDA
-Transformers path is slow, and what a packed-kernel runtime has to do.
+> **Document status:** This is a historical implementation handoff and a
+> record of design decisions, completed phases, performance work, and
+> host-specific measurement guidance. It is not the current task queue. Use
+> `AGENTS.md` for current operating instructions, `docs/FIDELITY.md` for model
+> representations and correctness baselines, and `docs/SOURCES.md` for source
+> provenance.
+
+The original sessions diagnosed why `vllm serve deepgrove/maple-preview`
+failed on Spark, why the Hugging Face CUDA Transformers path is slow, and what
+a packed-kernel runtime had to do.
 
 **Phase 1–5 are done.** Exact-head sampled decode is ~368 tok/s. FlashHead
 (`--flash-head`) is ~487 tok/s on the 256-tok bench / ~489 tok/s on 700-tok

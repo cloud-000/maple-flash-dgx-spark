@@ -169,6 +169,31 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_sampling_args(generate)
 
+    fidelity = sub.add_parser(
+        "fidelity",
+        help="Teacher-forced original bf16 vs packed exact-head fidelity report",
+    )
+    fidelity.add_argument("--model", required=True, help="Packed checkpoint directory")
+    fidelity.add_argument(
+        "--original",
+        default="deepgrove/maple-preview",
+        help="Original bf16 checkpoint directory or locally cached Hugging Face repo (default: deepgrove/maple-preview)",
+    )
+    fidelity.add_argument("--prompts", required=True, help="Text/JSONL prompt corpus")
+    fidelity.add_argument("--output", required=True, help="JSON report path")
+    fidelity.add_argument("--limit", type=int, default=None, help="Maximum prompts")
+    fidelity.add_argument(
+        "--split", default=None, help="Dataset split when --prompts is a dataset id"
+    )
+    fidelity.add_argument(
+        "--max-seq-len", type=int, default=512, help="Maximum tokens per prompt (default 512)"
+    )
+    fidelity.add_argument("--max-kl", type=float, default=None, help="Fail if mean forward KL exceeds this")
+    fidelity.add_argument(
+        "--min-top1-agreement", type=float, default=None,
+        help="Fail if aggregate top-1 agreement is lower",
+    )
+
     sub.add_parser(
         "eval",
         help="Moved to the bench project (OpenAI-compatible quality evals)",
@@ -521,6 +546,29 @@ def main(argv: list[str] | None = None) -> int:
             draft_len=args.draft_len,
         )
         return 0
+    if args.cmd == "fidelity":
+        if args.limit is not None and args.limit < 1:
+            parser.error("--limit must be >= 1")
+        if args.max_seq_len < 2:
+            parser.error("--max-seq-len must be >= 2")
+        if args.max_kl is not None and args.max_kl < 0:
+            parser.error("--max-kl must be >= 0")
+        if args.min_top1_agreement is not None and not 0 <= args.min_top1_agreement <= 1:
+            parser.error("--min-top1-agreement must be in [0, 1]")
+        from maple_run.fidelity import run_fidelity
+
+        ok = run_fidelity(
+            args.model,
+            args.prompts,
+            output=args.output,
+            original_dir=args.original,
+            limit=args.limit,
+            split=args.split,
+            max_seq_len=args.max_seq_len,
+            max_kl=args.max_kl,
+            min_top1_agreement=args.min_top1_agreement,
+        )
+        return 0 if ok else 1
     if args.cmd == "serve":
         _validate_sampling_args(parser, args)
         if args.port < 0 or args.port > 65535:
