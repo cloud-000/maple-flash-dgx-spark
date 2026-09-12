@@ -116,6 +116,21 @@ def test_cli_rejects_bad_sampling_args():
         main(["generate", "--model", "x", "--prompt", "y", "--max-tokens", "-2"])
 
 
+def test_cli_generate_rejects_conflicting_head_modes():
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "generate",
+                "--model",
+                "x",
+                "--prompt",
+                "y",
+                "--dense-head",
+                "--flash-head",
+            ]
+        )
+
+
 def test_generate_defaults_are_sampled():
     assert DEFAULT_TEMPERATURE == 1.0
     assert DEFAULT_TOP_P == 0.95

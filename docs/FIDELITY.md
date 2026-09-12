@@ -72,6 +72,25 @@ round-to-nearest quantization with group size 64.
 | B versus C | Do the optimized packed runtime and kernels reproduce the same quantized model as a simple dense implementation? |
 | A versus C | What is the total observed difference between original bf16 Transformers and production `maple-run`? |
 
+### Dense-head capability evaluation
+
+DeepGrove model card states that its reported capability comparison uses a
+dense output head. For a like-for-like quality evaluation without loading the
+complete dense Transformers model, `maple-run` provides an opt-in hybrid:
+
+- packed ternary transformer projections and production kernels;
+- packed 4-bit token embedding;
+- original checkpoint dense bf16 `lm_head.weight`;
+- original checkpoint tokenizer as the canonical token-ID source.
+
+Run it with
+`maple-run serve --dense-head --max-len 65536 --max-tokens 64000`.
+The normal exact-head path remains the full-vocabulary 4-bit packed head and
+is unchanged. Dense-head mode is for quality attribution, not speed
+benchmarking, and cannot be combined with FlashHead. The server context must
+cover the benchmark generation cap: a 32,768-token server silently turns a
+64,000-token evaluation request into a length-truncated response.
+
 Top-1 agreement need not be 100% even when two paths implement the same
 quantized weights. Dense and packed kernels accumulate floating-point sums in
 different orders and round at different points. Attention softmax can amplify

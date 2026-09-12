@@ -373,17 +373,30 @@ def _try_decode_graph(
     return captured
 
 
-def load_packed(model_dir: str, flash_head: bool = False):
+def load_packed(
+    model_dir: str,
+    flash_head: bool = False,
+    dense_head_source: str | None = None,
+):
     """Load a packed Maple checkpoint and its tokenizer."""
     from transformers import AutoTokenizer
 
     from maple_run.model import MapleForCausalLM
 
     model_dir = str(Path(model_dir).expanduser())
-    model = MapleForCausalLM.from_packed(model_dir, use_flash_head=flash_head)
+    model = MapleForCausalLM.from_packed(
+        model_dir,
+        use_flash_head=flash_head,
+        dense_head_source=dense_head_source,
+    )
+    tokenizer_source = dense_head_source or model_dir
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="You are using a model of type")
-        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_source,
+            trust_remote_code=True,
+            fix_mistral_regex=True,
+        )
     return model, tokenizer
 
 
@@ -1460,6 +1473,7 @@ def generate(
     top_k: int = DEFAULT_TOP_K,
     seed: int | None = None,
     flash_head: bool = False,
+    dense_head_source: str | None = None,
     eggroll: str | None = None,
     nextlat: bool = False,
     draft_len: int = 5,
@@ -1469,7 +1483,11 @@ def generate(
     print(f"Loading packed model from {model_dir}", flush=True)
     if eggroll:
         flash_head = False
-    model, tokenizer = load_packed(model_dir, flash_head=flash_head)
+    model, tokenizer = load_packed(
+        model_dir,
+        flash_head=flash_head,
+        dense_head_source=dense_head_source,
+    )
     if eggroll:
         from maple_run.eggroll.es import EggrollRuntime
 

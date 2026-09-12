@@ -19,6 +19,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 from maple_run.kernels.decode_attn import apply_qkv_decode, decode_gqa_attn, gqa_splits
@@ -563,7 +564,11 @@ def _as_uint32(t: torch.Tensor) -> torch.Tensor:
 
 
 def packed_decode_bytes(
-    config: dict, side_bytes: int = 2, *, flash_head: bool = False
+    config: dict,
+    side_bytes: int = 2,
+    *,
+    flash_head: bool = False,
+    dense_head: bool = False,
 ) -> dict[str, int]:
     """HBM bytes touched per decode token (weights only; KV depends on context).
 
@@ -596,7 +601,10 @@ def packed_decode_bytes(
     expert_codes = n_layers * topk * (2 * inter * hidden + hidden * inter) * 2 // 8
     expert_alpha = n_layers * expert_rows * 4
     meta = config.get("flash_head") or (config.get("maple_run") or {}).get("flash_head")
-    if flash_head and meta:
+    if dense_head:
+        head_codes = vocab * hidden * 2
+        head_scales = 0
+    elif flash_head and meta:
         n_clusters = int(meta["n_clusters"])
         n_probes = int(meta.get("n_probes", 512))
         cluster_size = int(meta["cluster_size"])
@@ -604,8 +612,9 @@ def packed_decode_bytes(
         head_rows = n_clusters + n_probes * cluster_size + n_force
     else:
         head_rows = vocab
-    head_codes = head_rows * hidden * 4 // 8
-    head_scales = head_rows * (hidden // group) * side_bytes * 2
+    if not dense_head:
+        head_codes = head_rows * hidden * 4 // 8
+        head_scales = head_rows * (hidden // group) * side_bytes * 2
     norms = n_layers * (2 * hidden + 2 * head_dim) * 4 + hidden * 4
     packed = (
         attn_codes
@@ -657,6 +666,7 @@ class MapleForCausalLM:
         self.norm = None
         self.lm_head = None
         self.lm_head_flash = None
+        self.dense_head = False
         self.rotary = MapleRotaryEmbedding(
             self.head_dim,
             float(config.get("partial_rotary_factor", 0.5)),
@@ -672,6 +682,7 @@ class MapleForCausalLM:
         device: str | torch.device = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         use_flash_head: bool = False,
+        dense_head_source: str | Path | None = None,
     ):
         model_dir = Path(model_dir).expanduser()
         config = json.loads((model_dir / "config.json").read_text())
@@ -687,6 +698,8 @@ class MapleForCausalLM:
                 "Checkpoint has no FlashHead clusters. Attach them with "
                 "`maple-run convert --flash-head-only` on the packed directory."
             )
+        if use_flash_head and dense_head_source is not None:
+            raise ValueError("dense BF16 head and FlashHead are mutually exclusive")
 
         index_path = model_dir / "model.safetensors.index.json"
         if index_path.exists():
@@ -704,9 +717,12 @@ class MapleForCausalLM:
                     del shard[key]
             weights.update(shard)
 
-        return cls.from_weight_dict(
+        model = cls.from_weight_dict(
             config, weights, device=device, dtype=dtype, use_flash_head=use_flash_head
         )
+        if dense_head_source is not None:
+            model.use_dense_head(dense_head_source)
+        return model
 
     @classmethod
     def from_weight_dict(
@@ -834,6 +850,35 @@ class MapleForCausalLM:
             )
         self.layers = layers
 
+    def use_dense_head(self, original_dir: str | Path) -> None:
+        """Replace the packed RTN4 head with the original BF16 output head.
+
+        Maple transformer projections remain packed ternary and its token
+        embedding remains affine 4-bit. This opt-in representation matches the
+        model card capability-evaluation boundary: a dense output head, without
+        loading the complete 40 GB Transformers model.
+        """
+        original = _resolve_original_checkpoint(original_dir)
+        index_path = original / "model.safetensors.index.json"
+        if not index_path.is_file():
+            raise FileNotFoundError(
+                f"original checkpoint has no safetensors index: {index_path}"
+            )
+        weight_map = json.loads(index_path.read_text())["weight_map"]
+        shard_name = weight_map.get("lm_head.weight")
+        if shard_name is None:
+            raise KeyError("original checkpoint index has no lm_head.weight")
+        with safe_open(str(original / shard_name), framework="pt", device="cpu") as shard:
+            weight = shard.get_tensor("lm_head.weight")
+        expected = (self.vocab_size, self.hidden_size)
+        if tuple(weight.shape) != expected:
+            raise ValueError(
+                f"dense lm_head shape {tuple(weight.shape)} does not match {expected}"
+            )
+        self.lm_head = DenseBF16Linear(weight.to(device=self.device, dtype=self.dtype))
+        self.lm_head_flash = None
+        self.dense_head = True
+
     def make_cache(self, max_len: int = 2048, batch: int = 1) -> KVCache:
         self.rotary.ensure_length(max_len)
         return KVCache(
@@ -925,4 +970,31 @@ class MapleForCausalLM:
             self.config,
             side_bytes=torch.empty(0, dtype=self.dtype).element_size(),
             flash_head=self.lm_head_flash is not None,
+            dense_head=self.dense_head,
         )
+
+
+class DenseBF16Linear:
+    """Dense source-checkpoint LM head used only for capability evaluation."""
+
+    def __init__(self, weight: torch.Tensor):
+        self.weight = weight.contiguous()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight)
+
+    __call__ = forward
+
+
+def _resolve_original_checkpoint(original: str | Path) -> Path:
+    path = Path(original).expanduser()
+    if path.is_dir():
+        return path
+    from maple_run.convert import _try_local_hub_snapshot
+
+    snapshot = _try_local_hub_snapshot(str(original))
+    if snapshot is None:
+        raise FileNotFoundError(
+            f"original checkpoint is not a directory and is not cached locally: {original}"
+        )
+    return snapshot

@@ -10,7 +10,8 @@ from maple_run import __version__
 _EVAL_MOVED = (
     "maple-run eval moved to the bench project.\n"
     "Serve the packed checkpoint, then run the harness:\n"
-    "  maple-run serve --model checkpoints/maple-2bit --port 8000\n"
+    "  maple-run serve --model checkpoints/maple-2bit --port 8000 "
+    "--max-len 65536\n"
     "  uv run --directory ../bench bench eval "
     "--base-url http://127.0.0.1:8000/v1 --model maple-2bit "
     "--output runs/maple-2bit"
@@ -53,6 +54,19 @@ def _add_sampling_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Approximate lm_head: score cluster centroids, then exact logits "
         "for the top 512 clusters (requires --flash-head-only on the checkpoint)",
+    )
+
+
+def _add_dense_head_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--dense-head",
+        action="store_true",
+        help="Evaluation mode: use the original BF16 lm_head with the packed ternary body",
+    )
+    parser.add_argument(
+        "--original",
+        default="deepgrove/maple-preview",
+        help="Original checkpoint supplying the dense BF16 head and canonical tokenizer",
     )
 
 
@@ -168,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         help="NextLat draft tokens per verify round (default 5)",
     )
     _add_sampling_args(generate)
+    _add_dense_head_args(generate)
 
     fidelity = sub.add_parser(
         "fidelity",
@@ -228,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
         help="KV cache length per slot, prompt + new tokens (default 8192)",
     )
     _add_sampling_args(serve)
+    _add_dense_head_args(serve)
 
     eggroll = sub.add_parser(
         "eggroll",
@@ -528,6 +544,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "generate":
         _validate_sampling_args(parser, args)
+        if args.dense_head and args.flash_head:
+            parser.error("--dense-head and --flash-head are mutually exclusive")
+        if args.dense_head and (args.eggroll or args.nextlat):
+            parser.error(
+                "--dense-head is an evaluation mode and cannot be combined "
+                "with --eggroll or --nextlat"
+            )
         if args.draft_len < 1:
             parser.error("--draft-len must be >= 1")
         from maple_run.generate import generate
@@ -541,6 +564,7 @@ def main(argv: list[str] | None = None) -> int:
             top_k=args.top_k,
             seed=args.seed,
             flash_head=args.flash_head,
+            dense_head_source=args.original if args.dense_head else None,
             eggroll=args.eggroll,
             nextlat=args.nextlat,
             draft_len=args.draft_len,
@@ -571,6 +595,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if ok else 1
     if args.cmd == "serve":
         _validate_sampling_args(parser, args)
+        if args.dense_head and args.flash_head:
+            parser.error("--dense-head and --flash-head are mutually exclusive")
         if args.port < 0 or args.port > 65535:
             parser.error("--port must be in 0..65535")
         if args.max_batch < 1:
@@ -589,6 +615,7 @@ def main(argv: list[str] | None = None) -> int:
             max_tokens=args.max_tokens,
             seed=args.seed,
             flash_head=args.flash_head,
+            dense_head_source=args.original if args.dense_head else None,
             max_batch=args.max_batch,
             max_len=args.max_len,
         )

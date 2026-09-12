@@ -1093,6 +1093,7 @@ def serve(
     max_tokens: int = 128,
     seed: int | None = None,
     flash_head: bool = False,
+    dense_head_source: str | None = None,
     max_batch: int = DEFAULT_MAX_BATCH,
     max_len: int = DEFAULT_MAX_LEN,
     engine: PackedEngine | None = None,
@@ -1112,7 +1113,11 @@ def serve(
     )
     if engine is None:
         print(f"Loading packed model from {model_dir}", flush=True)
-        model, tokenizer = load_packed(model_dir, flash_head=flash_head)
+        model, tokenizer = load_packed(
+            model_dir,
+            flash_head=flash_head,
+            dense_head_source=dense_head_source,
+        )
         log_model_traffic(model, flash_head=flash_head)
         engine = PackedEngine(model, tokenizer, defaults)
         engine.wait_ready()
@@ -1131,6 +1136,7 @@ def serve(
         f"Defaults: temperature={defaults.temperature} top_p={defaults.top_p} "
         f"top_k={defaults.top_k} max_tokens={defaults.max_tokens} "
         f"seed={defaults.seed} flash_head={defaults.flash_head} "
+        f"dense_head={dense_head_source is not None} "
         f"max_batch={defaults.max_batch} max_len={defaults.max_len}",
         flush=True,
     )

@@ -132,6 +132,54 @@ def test_packed_decode_bytes_beats_unpacked_estimate():
     assert unpacked / packed > 4
 
 
+def test_dense_head_traffic_replaces_rtn4_head_bytes():
+    cfg = json.loads((REPO / "docs/sources/maple-preview-config.json").read_text())
+    cfg["maple_run"] = {
+        "format": "packed-ternary-v1",
+        "rtn_4bit": {"group_size": 64, "bits": 4},
+    }
+    packed = packed_decode_bytes(cfg)
+    dense = packed_decode_bytes(cfg, dense_head=True)
+    expected_delta = cfg["vocab_size"] * cfg["hidden_size"] * 2 - (
+        cfg["vocab_size"] * cfg["hidden_size"] // 2
+        + cfg["vocab_size"] * (cfg["hidden_size"] // 64) * 2 * 2
+    )
+    assert dense["packed_weight_bytes"] - packed["packed_weight_bytes"] == expected_delta
+
+
+def test_dense_bf16_linear_matches_torch_linear():
+    from maple_run.model import DenseBF16Linear
+
+    weight = torch.randn(7, 4, dtype=torch.bfloat16)
+    x = torch.randn(2, 3, 4, dtype=torch.bfloat16)
+    layer = DenseBF16Linear(weight)
+    torch.testing.assert_close(layer(x), torch.nn.functional.linear(x, weight))
+
+
+def test_use_dense_head_loads_only_source_head(tmp_path: Path):
+    from safetensors.torch import save_file
+
+    from maple_run.model import DenseBF16Linear, MapleForCausalLM
+
+    cfg = _tiny_config()
+    weight = torch.randn(
+        cfg["vocab_size"], cfg["hidden_size"], dtype=torch.bfloat16
+    )
+    shard_name = "source.safetensors"
+    save_file({"lm_head.weight": weight}, tmp_path / shard_name)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"lm_head.weight": shard_name}})
+    )
+    model = MapleForCausalLM(
+        cfg, device=torch.device("cpu"), dtype=torch.bfloat16
+    )
+    model.use_dense_head(tmp_path)
+    assert isinstance(model.lm_head, DenseBF16Linear)
+    assert model.dense_head
+    assert model.lm_head_flash is None
+    torch.testing.assert_close(model.lm_head.weight, weight)
+
+
 @cuda
 def test_tiny_forward_and_generate_shapes():
     from maple_run.model import MapleForCausalLM
