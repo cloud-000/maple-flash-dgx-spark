@@ -14,6 +14,7 @@ activations still need an attention kernel (SDPA/FlashInfer/Triton), not Dao
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -463,11 +464,14 @@ class MapleSparseMoeBlock:
         self.down = down
         self.top_k = top_k
         self.moe_intermediate = moe_intermediate
+        self.router_hook = None
 
     def __call__(self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         bsz, seq_len, hidden = hidden_states.shape
         x = hidden_states.reshape(-1, hidden)
         topk_idx, topk_weight = router_topk(x, self.gate_weight, self.top_k)
+        if self.router_hook is not None:
+            self.router_hook(topk_idx)
         groups = None
         if x.shape[0] >= GROUPED_MIN_TOKENS:
             groups = expert_slot_groups(topk_idx, self.up_gate.packed_weight.shape[0])
@@ -849,6 +853,11 @@ class MapleForCausalLM:
                 )
             )
         self.layers = layers
+ 
+    def set_router_hook(self, hook: Callable[[int, torch.Tensor], None] | None) -> None:
+        """Attach an offline hook receiving (layer_idx, topk_idx) on each MoE forward."""
+        for i, layer in enumerate(self.layers):
+            layer.mlp.router_hook = (lambda idx, l=i: hook(l, idx)) if hook is not None else None
 
     def use_dense_head(self, original_dir: str | Path) -> None:
         """Replace the packed RTN4 head with the original BF16 output head.
