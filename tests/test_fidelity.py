@@ -21,6 +21,8 @@ from maple_run.fidelity import (
     threshold_outcomes,
     token_metrics,
     run_fidelity,
+    user_prompt_from_obj,
+    iter_user_prompts,
 )
 
 
@@ -130,7 +132,7 @@ def test_run_uses_original_tokenizer_as_canonical_ids(tmp_path, monkeypatch):
         lambda *_args, **_kwargs: (Original(), canonical_tokenizer),
     )
     monkeypatch.setattr(
-        "maple_run.nextlat_synth.iter_user_prompts",
+        "maple_run.fidelity.iter_user_prompts",
         lambda *_args, **_kwargs: iter(["hello"]),
     )
 
@@ -158,15 +160,16 @@ def _naive_attention(q, k, v, window=None):
 
 @pytest.mark.parametrize("window", [None, 3])
 def test_sdpa_adapter_matches_naive_causal_gqa(window):
-    torch.manual_seed(4)
-    q = torch.randn(1, 4, 5, 8)
-    k = torch.randn(1, 2, 5, 8)
-    v = torch.randn(1, 2, 5, 8)
+    torch.manual_seed(0)
+    q = torch.randn(2, 4, 7, 16)
+    k = torch.randn(2, 2, 9, 16)
+    v = torch.randn(2, 2, 9, 16)
     module = SimpleNamespace(num_heads=4, num_key_value_heads=2)
-    out, weights = sdpa_attention_forward(module, q, k, v, sliding_window=window)
-    want = _naive_attention(q, k.repeat_interleave(2, 1), v.repeat_interleave(2, 1), window)
-    torch.testing.assert_close(out.transpose(1, 2), want, rtol=1e-5, atol=1e-5)
-    assert weights is None
+    got, _ = sdpa_attention_forward(module, q, k, v, sliding_window=window)
+    k_rep = k.repeat_interleave(2, dim=1)
+    v_rep = v.repeat_interleave(2, dim=1)
+    want = _naive_attention(q, k_rep, v_rep, window=window).transpose(1, 2)
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
 
 
 def test_sdpa_adapter_rejects_sequence_major_maple_layout():
@@ -176,3 +179,21 @@ def test_sdpa_adapter_rejects_sequence_major_maple_layout():
     v = torch.randn(1, 64, 4, 128)
     with pytest.raises(FidelityError, match="wrong layout"):
         sdpa_attention_forward(module, q, k, v)
+
+
+def test_user_prompt_from_mt_bench_list():
+    assert user_prompt_from_obj({"prompt": ["Write a story", "Rewrite it"]}) == (
+        "Write a story"
+    )
+    assert user_prompt_from_obj({"text": "What is xyz"}) == "What is xyz"
+    assert (
+        user_prompt_from_obj(
+            {
+                "messages": [
+                    {"role": "user", "content": "Theme version?"},
+                    {"role": "assistant", "content": "You are on Responsive 6."},
+                ]
+            }
+        )
+        == "Theme version?"
+    )

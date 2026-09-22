@@ -1263,8 +1263,6 @@ def run_generate(
     on_reasoning: Callable[[str], None] | None = None,
     on_tool_calls: Callable[[list[dict]], None] | None = None,
     use_graph: bool | None = None,
-    nextlat=None,
-    draft_len: int = 5,
     stop_ids: set[int] | None = None,
     early_stop: bool = True,
 ) -> GenerateResult:
@@ -1305,40 +1303,6 @@ def run_generate(
         in_think=prompt_in_think(tokenizer, input_ids),
         skip_ids=skip_decode_ids(tokenizer, extra=stop_ids),
     )
-    if nextlat is not None:
-        from maple_run.nextlat import run_nextlat_generate
-
-        result = run_nextlat_generate(
-            model,
-            nextlat,
-            tokenizer,
-            input_ids,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            generator=generator,
-            stop_ids=stop_ids,
-            draft_len=draft_len,
-            decoder=decoder,
-            log=emit,
-            on_token=on_token,
-            on_text=on_text,
-            on_reasoning=on_reasoning,
-            on_tool_calls=on_tool_calls,
-        )
-        if prompt_len and result.prefill_s > 0:
-            emit(
-                f"Prefill: {prompt_len} tok in {result.prefill_s:.2f}s "
-                f"({prompt_len / result.prefill_s:.1f} tok/s)"
-            )
-        if result.n_new and result.decode_s > 0:
-            emit(
-                f"Decode:  {result.n_new} tok in {result.decode_s:.2f}s "
-                f"({result.n_new / result.decode_s:.1f} tok/s)"
-            )
-        return result
-
     cache = model.make_cache(max_len=prompt_len + max(max_tokens, 1))
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1352,11 +1316,7 @@ def run_generate(
         torch.cuda.synchronize()
         t_prefill = time.perf_counter()
         graph = None
-        eggroll = getattr(model, "eggroll", None)
-        # Live rank-1 noise must not bake into a captured graph.
-        allow_graph = use_graph if use_graph is not None else not (
-            eggroll is not None and eggroll.noise_active
-        )
+        allow_graph = use_graph if use_graph is not None else True
         if max_tokens > 1 and allow_graph:
             graph = _try_decode_graph(
                 model,
@@ -1474,31 +1434,15 @@ def generate(
     seed: int | None = None,
     flash_head: bool = False,
     dense_head_source: str | None = None,
-    eggroll: str | None = None,
-    nextlat: bool = False,
-    draft_len: int = 5,
 ) -> GenerateResult:
     """Load a packed checkpoint, decode, print text and tok/s."""
     model_dir = str(Path(model_dir).expanduser())
     print(f"Loading packed model from {model_dir}", flush=True)
-    if eggroll:
-        flash_head = False
     model, tokenizer = load_packed(
         model_dir,
         flash_head=flash_head,
         dense_head_source=dense_head_source,
     )
-    if eggroll:
-        from maple_run.eggroll.es import EggrollRuntime
-
-        EggrollRuntime.load(eggroll).attach(model)
-        print(f"Loaded EGGROLL adapters from {eggroll}", flush=True)
-    dynamics = None
-    if nextlat:
-        from maple_run.nextlat import load_nextlat_for_model
-
-        dynamics = load_nextlat_for_model(model, model_dir)
-        print("Loaded NextLat latent dynamics (speculative decode)", flush=True)
     log_model_traffic(model, flash_head=flash_head)
     warmup_model(model, flash_head=flash_head)
     input_ids = encode_user_prompt(tokenizer, prompt, model.device)
@@ -1511,8 +1455,6 @@ def generate(
         top_p=top_p,
         top_k=top_k,
         seed=seed,
-        nextlat=dynamics,
-        draft_len=draft_len,
     )
     if result.reasoning:
         print(f"<think>\n{result.reasoning}\n</think>\n\n{result.text}", flush=True)

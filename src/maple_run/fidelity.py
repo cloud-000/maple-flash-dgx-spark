@@ -293,6 +293,99 @@ def threshold_outcomes(summary: dict[str, Any], max_kl: float | None, min_top1: 
     return outcomes
 
 
+def user_prompt_from_obj(obj: dict) -> str:
+    """First user string: UltraChat ``messages``, then prompt/text/content."""
+    messages = obj.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if str(msg.get("role", "")).lower() == "user":
+                text = str(msg.get("content") or "").strip()
+                if text:
+                    return text
+    raw = obj.get("prompt", None)
+    if raw is None:
+        raw = obj.get("text") or obj.get("content")
+    if raw is None:
+        raise ValueError("row missing messages/prompt/text/content")
+    if isinstance(raw, list):
+        if not raw:
+            raise ValueError("jsonl prompt list is empty")
+        raw = raw[0]
+    text = str(raw).strip()
+    if not text:
+        raise ValueError("jsonl prompt is empty")
+    return text
+
+
+def _iter_hf_prompts(repo: str, *, split: str | None, limit: int | None):
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError(
+            "Hugging Face --prompts needs the eval extra: "
+            "uv sync --extra cuda --extra tokenizer --extra eval"
+        ) from exc
+    splits = [split] if split else ["train_sft", "train"]
+    last_err: Exception | None = None
+    ds = None
+    for name in splits:
+        if not name:
+            continue
+        try:
+            ds = load_dataset(repo, split=name, streaming=True)
+            break
+        except Exception as exc:
+            last_err = exc
+            ds = None
+    if ds is None:
+        raise ValueError(
+            f"could not load {repo!r} (tried splits {splits}): {last_err}"
+        )
+    n = 0
+    for row in ds:
+        yield user_prompt_from_obj(dict(row))
+        n += 1
+        if limit is not None and n >= int(limit):
+            return
+
+
+def iter_user_prompts(
+    path: str | Path, *, limit: int | None = None, split: str | None = None
+):
+    raw = str(path)
+    file_path = Path(raw)
+    if not file_path.exists() and "/" in raw and not raw.endswith(".jsonl"):
+        yield from _iter_hf_prompts(raw, split=split, limit=limit)
+        return
+    n = 0
+    if file_path.suffix.lower() == ".jsonl":
+        with file_path.open() as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                try:
+                    yield user_prompt_from_obj(obj)
+                except ValueError as exc:
+                    raise ValueError(f"{file_path}:{line_no}: {exc}") from exc
+                n += 1
+                if limit is not None and n >= int(limit):
+                    return
+        return
+    with file_path.open() as f:
+        for line in f:
+            text = line.strip()
+            if not text:
+                continue
+            yield text
+            n += 1
+            if limit is not None and n >= int(limit):
+                return
+
+
 def run_fidelity(
     model_dir: str, prompts: str, *, output: str, original_dir: str = DEFAULT_ORIGINAL,
     limit: int | None = None, split: str | None = None, max_seq_len: int = 512,
@@ -302,7 +395,6 @@ def run_fidelity(
     import torch
     from maple_run.generate import encode_user_prompt
     from maple_run.model import MapleForCausalLM
-    from maple_run.nextlat_synth import iter_user_prompts
 
     if max_seq_len < 2:
         raise ValueError("max_seq_len must be >= 2")

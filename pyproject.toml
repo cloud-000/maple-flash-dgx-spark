@@ -20,7 +20,6 @@ tokenizer = [
 ]
 eval = [
     "datasets>=3.0.0",
-    "sympy>=1.13.0",
 ]
 dev = [
     "pytest>=8.0.0",

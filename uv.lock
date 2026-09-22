@@ -676,7 +676,6 @@ dev = [
 ]
 eval = [
     { name = "datasets" },
-    { name = "sympy" },
 ]
 tokenizer = [
     { name = "transformers" },
@@ -689,7 +688,6 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "safetensors", specifier = ">=0.5.0" },
-    { name = "sympy", marker = "extra == 'eval'", specifier = ">=1.13.0" },
     { name = "torch", marker = "extra == 'cuda'", specifier = "==2.13.0" },
     { name = "transformers", marker = "extra == 'tokenizer'", specifier = ">=4.57.0" },
     { name = "triton", marker = "extra == 'cuda'", specifier = "==3.7.1" },

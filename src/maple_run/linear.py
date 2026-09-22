@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from maple_run.eggroll.perturb import add_adapter_delta
 from maple_run.kernels.rtn4 import rtn4_embedding, rtn4_gemv
 from maple_run.kernels.ternary_expert import (
     ternary_expert_down_sum,
@@ -29,14 +28,13 @@ class PackedTernaryLinear:
         self.row_alpha = row_alpha
 
     def forward(self, x, rms_weight=None, rms_eps: float = 1e-6):
-        y = ternary_gemv(
+        return ternary_gemv(
             x,
             self.packed_weight,
             self.row_alpha,
             rms_weight=rms_weight,
             rms_eps=rms_eps,
         )
-        return add_adapter_delta(self, y, x, rms_weight=rms_weight, rms_eps=rms_eps)
 
     __call__ = forward
 
@@ -49,20 +47,18 @@ class PackedTernaryExperts:
         self.row_alpha = row_alpha
 
     def forward(self, x, expert_ids, slot_groups=None):
-        y = ternary_expert_gemv(
+        return ternary_expert_gemv(
             x,
             self.packed_weight,
             self.row_alpha,
             expert_ids,
             slot_groups=slot_groups,
         )
-        return add_adapter_delta(self, y, x, expert_ids=expert_ids)
 
     def swiglu(self, x, expert_ids, slot_groups=None):
-        y = ternary_expert_swiglu(
+        return ternary_expert_swiglu(
             x, self.packed_weight, self.row_alpha, expert_ids, slot_groups=slot_groups
         )
-        return add_adapter_delta(self, y, x, expert_ids=expert_ids)
 
     def down_sum(self, x, expert_ids, topk_weight, residual=None):
         return ternary_expert_down_sum(
@@ -88,14 +84,13 @@ class PackedRTN4Linear:
         self.group_size = group_size
 
     def forward(self, x):
-        y = rtn4_gemv(
+        return rtn4_gemv(
             x,
             self.packed_weight,
             self.scales,
             self.biases,
             group_size=self.group_size,
         )
-        return add_adapter_delta(self, y, x)
 
     __call__ = forward
 
