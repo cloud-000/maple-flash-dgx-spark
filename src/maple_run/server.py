@@ -54,6 +54,17 @@ from maple_run.kernels.sampler import (
     fused_sample_batched,
 )
 
+from maple_run.system_one import (
+    SystemOneError,
+    SystemOneEvaluator,
+    SystemOneRequest,
+    SystemOneResponse,
+    is_system_one_request,
+    openai_to_system_one,
+    parse_system_one_request,
+    system_one_to_openai_chat_completion,
+)
+
 DEFAULT_MAX_BATCH = 8
 DEFAULT_MAX_LEN = 8192
 
@@ -315,9 +326,22 @@ def models_list(model_id: str) -> dict:
                 "id": model_id,
                 "object": "model",
                 "owned_by": "maple-run",
-            }
+            },
+            {
+                "id": f"{model_id}-system1",
+                "object": "model",
+                "owned_by": "maple-run",
+            },
         ],
     }
+
+
+@dataclass
+class _SystemOneJob:
+    request: SystemOneRequest
+    done: threading.Event = field(default_factory=threading.Event)
+    result: SystemOneResponse | None = None
+    error: BaseException | None = None
 
 
 @dataclass
@@ -361,7 +385,8 @@ class PackedEngine:
         self.defaults = defaults
         self.max_batch = int(defaults.max_batch)
         self.max_len = int(defaults.max_len)
-        self._queue: queue.Queue[_Job | None] = queue.Queue()
+        self._queue: queue.Queue[_Job | _SystemOneJob | None] = queue.Queue()
+        self._system_one: SystemOneEvaluator | None = None
         self._ready = threading.Event()
         self._stop = threading.Event()
         self._start_error: BaseException | None = None
@@ -420,6 +445,31 @@ class PackedEngine:
             raise RuntimeError("PackedEngine.complete needs a tokenizer")
         input_ids = encode_prompt(self.tokenizer, prompt, self.model.device)
         return self._submit(input_ids, sampling, on_text)
+
+    def evaluate_system_one(self, request: SystemOneRequest) -> SystemOneResponse:
+        self.wait_ready()
+        if self.tokenizer is None:
+            raise RuntimeError("PackedEngine.evaluate_system_one needs a tokenizer")
+        job = _SystemOneJob(request=request)
+        self._queue.put(job)
+        job.done.wait()
+        if job.error is not None:
+            raise job.error
+        assert job.result is not None
+        return job.result
+
+    def _execute_system_one(self, job: _SystemOneJob) -> None:
+        try:
+            if self._system_one is None:
+                if self.tokenizer is not None:
+                    self._system_one = SystemOneEvaluator(self.model, self.tokenizer)
+                else:
+                    raise RuntimeError("PackedEngine has no tokenizer for System One")
+            job.result = self._system_one.evaluate_request(job.request)
+        except BaseException as exc:
+            job.error = exc
+        finally:
+            job.done.set()
 
     def run(
         self,
@@ -530,6 +580,10 @@ class PackedEngine:
             self.max_batch,
             model.device,
         )
+        if self.tokenizer is not None:
+            self._system_one = SystemOneEvaluator(self.model, self.tokenizer)
+        else:
+            self._system_one = None
 
     def _admit(self) -> bool:
         """Fill free slots from the queue. False means the worker should exit."""
@@ -547,6 +601,9 @@ class PackedEngine:
             if job is None:
                 self._drain_stop()
                 return False
+            if isinstance(job, _SystemOneJob):
+                self._execute_system_one(job)
+                continue
             self._admit_job(job)
         return True
 
@@ -848,9 +905,12 @@ def make_handler(engine: PackedEngine):
                 return
             if path.startswith("/v1/models/"):
                 model_id = path[len("/v1/models/") :]
-                if model_id == engine.defaults.model_id:
-                    self._json(200, models_list(model_id)["data"][0])
-                    return
+                valid_ids = {engine.defaults.model_id, f"{engine.defaults.model_id}-system1"}
+                if model_id in valid_ids:
+                    for item in models_list(engine.defaults.model_id)["data"]:
+                        if item["id"] == model_id:
+                            self._json(200, item)
+                            return
                 self._json(404, error_body(f"model {model_id} not found", "not_found_error"))
                 return
             self._json(404, error_body(f"unknown path {path}", "not_found_error"))
@@ -859,13 +919,16 @@ def make_handler(engine: PackedEngine):
             path = urlparse(self.path).path.rstrip("/") or "/"
             try:
                 body = self._read_json()
+                if path in ("/v1/systemone", "/v1/evaluate", "/v1/decisions"):
+                    self._system_one(body)
+                    return
                 if path == "/v1/chat/completions":
                     self._chat(body)
                     return
                 if path == "/v1/completions":
                     self._completions(body)
                     return
-            except RequestError as exc:
+            except (RequestError, SystemOneError) as exc:
                 self._json(exc.status, error_body(str(exc)))
                 return
             except Exception as exc:
@@ -886,7 +949,30 @@ def make_handler(engine: PackedEngine):
                 raise RequestError("JSON body must be an object")
             return body
 
+        def _system_one(self, body: dict) -> None:
+            if not hasattr(engine, "evaluate_system_one"):
+                raise RequestError("engine does not support System One evaluation", 501)
+            req = parse_system_one_request(body, default_model=engine.defaults.model_id)
+            resp = engine.evaluate_system_one(req)
+            self._json(200, resp.to_dict())
+
         def _chat(self, body: dict) -> None:
+            req_headers = {k.lower(): v for k, v in self.headers.items()}
+            if hasattr(engine, "evaluate_system_one") and is_system_one_request(
+                body, headers=req_headers
+            ):
+                req = openai_to_system_one(body, default_model=engine.defaults.model_id)
+                resp = engine.evaluate_system_one(req)
+                created = int(time.time())
+                req_id = f"chatcmpl-{uuid.uuid4().hex}"
+                self._json(
+                    200,
+                    system_one_to_openai_chat_completion(
+                        resp, req_id=req_id, created=created, model=req.model
+                    ),
+                )
+                return
+
             messages = apply_system_prompt(body, parse_chat_messages(body))
             sampling = parse_sampling(body, engine.defaults)
             tools = parse_tools(body)

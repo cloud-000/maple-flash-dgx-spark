@@ -662,3 +662,43 @@ def test_scheduler_padding_seqlen_stays_reset():
         assert len(second.token_ids) == 12
     finally:
         engine.close()
+
+
+@cuda
+def test_packed_engine_system_one():
+    """PackedEngine handles System One fast discriminative evaluation without allocating decode slots."""
+    from maple_run.system_one import NoulQuestion, SystemOneRequest
+
+    class TinyTok:
+        def __init__(self):
+            self.vocab = {"Yes": 1, "No": 2}
+        def encode(self, text: str, add_special_tokens: bool = False, return_tensors: str | None = None):
+            if text in self.vocab:
+                ids = [self.vocab[text]]
+            else:
+                ids = [10, 11]
+            if return_tensors == "pt":
+                return torch.tensor(ids, dtype=torch.long)
+            return ids
+        def get_vocab(self):
+            return self.vocab
+
+    model, cfg = _tiny_batch_model()
+    tok = TinyTok()
+    engine = PackedEngine(
+        model, tok, ServerDefaults(max_batch=2, max_len=32, model_id="tiny")
+    )
+    try:
+        engine.wait_ready()
+        req = SystemOneRequest(
+            model="tiny",
+            state="A quick test prompt",
+            questions={"ok": NoulQuestion(instructions="Is this test ok?")},
+        )
+        res = engine.evaluate_system_one(req)
+        assert res.model == "tiny"
+        assert "ok" in res.nouls
+        assert 0.0 <= res.nouls["ok"].noul <= 1.0
+        assert engine._live == 0
+    finally:
+        engine.close()

@@ -190,6 +190,33 @@ def main(argv: list[str] | None = None) -> int:
     _add_sampling_args(serve)
     _add_dense_head_args(serve)
 
+    # 5. evaluate
+    evaluate = sub.add_parser(
+        "evaluate",
+        help="System One (Jev) fast discriminative evaluation on packed checkpoint",
+    )
+    evaluate.add_argument("--model", required=True, help="Packed checkpoint directory")
+    evaluate.add_argument(
+        "--request",
+        default=None,
+        help="Path to JSON file containing System One request body",
+    )
+    evaluate.add_argument(
+        "--state",
+        default=None,
+        help="Inline state context string (when not using --request)",
+    )
+    evaluate.add_argument(
+        "--question",
+        default=None,
+        help="Inline JSON string of questions or a single question definition",
+    )
+    evaluate.add_argument(
+        "--output",
+        default=None,
+        help="Optional path to write output JSON response",
+    )
+
     args = parser.parse_args(argv)
 
     if args.cmd == "convert":
@@ -298,6 +325,48 @@ def main(argv: list[str] | None = None) -> int:
             max_batch=args.max_batch,
             max_len=args.max_len,
         )
+        return 0
+
+    if args.cmd == "evaluate":
+        import json
+        from pathlib import Path
+        from maple_run.generate import load_packed
+        from maple_run.system_one import (
+            SystemOneEvaluator,
+            parse_system_one_request,
+        )
+
+        if args.request:
+            req_path = Path(args.request)
+            if not req_path.exists():
+                parser.error(f"request file not found: {args.request}")
+            body = json.loads(req_path.read_text(encoding="utf-8"))
+        elif args.state and args.question:
+            try:
+                q_data = json.loads(args.question)
+            except Exception as e:
+                parser.error(f"invalid JSON in --question: {e}")
+            if "type" in q_data:
+                questions = {"eval": q_data}
+            else:
+                questions = q_data
+            body = {
+                "model": Path(args.model).name,
+                "state": args.state,
+                "questions": questions,
+            }
+        else:
+            parser.error("must provide either --request <file.json> or both --state and --question")
+
+        model, tokenizer = load_packed(args.model)
+        evaluator = SystemOneEvaluator(model, tokenizer)
+        req = parse_system_one_request(body, default_model=Path(args.model).name)
+        resp = evaluator.evaluate_request(req)
+        result_dict = resp.to_dict()
+        out_json = json.dumps(result_dict, indent=2, ensure_ascii=False)
+        if args.output:
+            Path(args.output).write_text(out_json, encoding="utf-8")
+        print(out_json)
         return 0
 
     return 0

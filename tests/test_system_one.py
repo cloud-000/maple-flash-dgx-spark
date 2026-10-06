@@ -252,3 +252,240 @@ def test_evaluator_full_request():
     assert resp.scores["tier"].score > 1.8
     assert resp.usage["input_tokens"] > 0
     assert resp.usage["output_tokens"] == 0
+
+
+from maple_run.server import ServerDefaults, make_handler
+from maple_run.system_one.adapter import (
+    is_system_one_request,
+    openai_to_system_one,
+    system_one_to_openai_chat_completion,
+)
+from http.server import ThreadingHTTPServer
+from http.client import HTTPConnection
+from contextlib import contextmanager
+import json
+import threading
+
+
+def test_is_system_one_request():
+    # 1. Model suffix
+    assert is_system_one_request({"model": "maple-preview-system1"})
+    assert is_system_one_request({"model": "maple-2bit-system1"})
+    # 2. Header
+    assert is_system_one_request({"model": "maple-preview"}, headers={"x-decision-mode": "system1"})
+    assert is_system_one_request({"model": "maple-preview"}, headers={"X-Decision-Mode": "system1"})
+    # 3. Explicit system_one field
+    assert is_system_one_request({"model": "maple-preview", "system_one": True})
+    # 4. Questions field
+    assert is_system_one_request({"model": "maple-preview", "questions": {"q": {"type": "noul", "instructions": "test"}}})
+    # 5. Standard chat request
+    assert not is_system_one_request({"model": "maple-preview", "messages": [{"role": "user", "content": "hello"}]})
+
+
+def test_openai_to_system_one_json_schema():
+    body = {
+        "model": "maple-2bit-system1",
+        "messages": [
+            {"role": "system", "content": "You are a decision classifier."},
+            {"role": "user", "content": "Customer cannot log in to their dashboard."},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "is_account_issue": {
+                            "type": "boolean",
+                            "description": "Is this an account login issue?",
+                        },
+                        "dept": {
+                            "type": "string",
+                            "enum": ["auth", "billing", "general"],
+                            "description": "Responsible department",
+                        },
+                        "urgency": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 3,
+                            "description": "Urgency rating",
+                        },
+                    },
+                    "required": ["is_account_issue", "dept"],
+                }
+            },
+        },
+    }
+    req = openai_to_system_one(body)
+    assert req.model == "maple-2bit"
+    assert "Customer cannot log in to their dashboard." in req.state
+    assert isinstance(req.questions["is_account_issue"], NoulQuestion)
+    assert isinstance(req.questions["dept"], ChoiceQuestion)
+    assert isinstance(req.questions["urgency"], ScoreQuestion)
+    assert req.questions["dept"].option_keys() == ["auth", "billing", "general"]
+
+
+def test_system_one_to_openai_chat_completion():
+    resp = SystemOneResponse(
+        model="maple-2bit",
+        nouls={"is_bug": NoulResult(noul=0.88)},
+        choices={"team": ChoiceResult(choice="eng", confidence=0.92, probabilities={"eng": 0.92, "ops": 0.08})},
+        scores={"severity": ScoreResult(score=3.0, confidence=0.95, probabilities=[0.05, 0.0, 0.95], legend=["1", "2", "3"])},
+        usage={"input_tokens": 35, "output_tokens": 0},
+    )
+    chat_resp = system_one_to_openai_chat_completion(resp, req_id="chatcmpl-test", created=1234567890, model="maple-2bit-system1")
+    assert chat_resp["id"] == "chatcmpl-test"
+    assert chat_resp["model"] == "maple-2bit-system1"
+    assert chat_resp["object"] == "chat.completion"
+    assert chat_resp["usage"]["completion_tokens"] == 0
+    assert chat_resp["choices"][0]["finish_reason"] == "stop"
+    
+    parsed_content = json.loads(chat_resp["choices"][0]["message"]["content"])
+    assert parsed_content["is_bug"] is True
+    assert chat_resp["system_one"]["nouls"]["is_bug"]["noul"] == 0.88
+    assert parsed_content["team"] == "eng"
+    assert parsed_content["severity"] == 3.0
+
+
+class SystemOneMockEngine:
+    def __init__(self, model_id: str = "maple-2bit"):
+        self.defaults = ServerDefaults(model_id=model_id)
+        # 101: Yes, 102: No, 201: A, 202: B, 301: 1, 302: 2
+        self.evaluator = SystemOneEvaluator(
+            DummyModel(logits_map={101: 5.0, 102: 0.0, 201: 4.0, 202: 1.0, 301: 0.0, 302: 5.0}),
+            DummyTokenizer(),
+        )
+
+    def evaluate_system_one(self, req: SystemOneRequest) -> SystemOneResponse:
+        return self.evaluator.evaluate_request(req)
+
+
+@contextmanager
+def _test_server(engine):
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine))
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield httpd.server_address[1]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+
+def _post_json(port: int, path: str, body: dict, headers: dict | None = None) -> tuple[int, dict]:
+    conn = HTTPConnection("127.0.0.1", port, timeout=5)
+    raw = json.dumps(body).encode()
+    hdrs = {"Content-Type": "application/json", "Content-Length": str(len(raw))}
+    if headers:
+        hdrs.update(headers)
+    conn.request("POST", path, body=raw, headers=hdrs)
+    resp = conn.getresponse()
+    payload = json.loads(resp.read().decode())
+    conn.close()
+    return resp.status, payload
+
+
+def _get_json(port: int, path: str) -> tuple[int, dict]:
+    conn = HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    payload = json.loads(resp.read().decode())
+    conn.close()
+    return resp.status, payload
+
+
+def test_server_system_one_routes():
+    engine = SystemOneMockEngine()
+    req_body = {
+        "state": "Checkout page is returning 500 status code",
+        "questions": {
+            "is_bug": {"type": "noul", "instructions": "Is this an error bug?"},
+            "component": {
+                "type": "choice",
+                "instructions": "Component responsible",
+                "criteria": {"checkout": "Checkout service", "auth": "Auth service"},
+            },
+        },
+    }
+    with _test_server(engine) as port:
+        # 1. /v1/systemone
+        s1, p1 = _post_json(port, "/v1/systemone", req_body)
+        assert s1 == 200
+        assert p1["nouls"]["is_bug"]["noul"] > 0.9
+        assert p1["choices"]["component"]["choice"] == "checkout"
+
+        # 2. /v1/evaluate alias
+        s2, p2 = _post_json(port, "/v1/evaluate", req_body)
+        assert s2 == 200
+        assert p2["choices"]["component"]["choice"] == "checkout"
+
+        # 3. /v1/decisions alias
+        s3, p3 = _post_json(port, "/v1/decisions", req_body)
+        assert s3 == 200
+        assert p3["nouls"]["is_bug"]["noul"] > 0.9
+
+        # 4. /v1/models list and item
+        sm, pm = _get_json(port, "/v1/models")
+        assert sm == 200
+        model_ids = [m["id"] for m in pm["data"]]
+        assert "maple-2bit" in model_ids
+        assert "maple-2bit-system1" in model_ids
+
+        sm_item, pm_item = _get_json(port, "/v1/models/maple-2bit-system1")
+        assert sm_item == 200
+        assert pm_item["id"] == "maple-2bit-system1"
+
+
+def test_server_chat_completions_interception():
+    engine = SystemOneMockEngine()
+    chat_body = {
+        "model": "maple-2bit-system1",
+        "messages": [{"role": "user", "content": "System is throwing 500 error on purchase."}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "is_error": {"type": "boolean", "description": "Is this an error?"},
+                        "tier": {"type": "string", "enum": ["high", "low"]},
+                    },
+                }
+            },
+        },
+    }
+    with _test_server(engine) as port:
+        status, payload = _post_json(port, "/v1/chat/completions", chat_body)
+        assert status == 200
+        assert payload["object"] == "chat.completion"
+        assert payload["usage"]["completion_tokens"] == 0
+        content = json.loads(payload["choices"][0]["message"]["content"])
+        assert "is_error" in content
+        assert "tier" in content
+
+
+def test_cli_evaluate(monkeypatch, capsys):
+    from maple_run.cli import main
+
+    def fake_load(model_path, **kwargs):
+        return (
+            DummyModel(logits_map={101: 5.0, 102: 0.0}),
+            DummyTokenizer(),
+        )
+
+    monkeypatch.setattr("maple_run.generate.load_packed", fake_load)
+
+    # Invoke evaluate with inline state and question
+    q_json = json.dumps({"type": "noul", "instructions": "Is this valid?"})
+    exit_code = main([
+        "evaluate",
+        "--model", "fake-model",
+        "--state", "Test context",
+        "--question", q_json,
+    ])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    res = json.loads(captured.out)
+    assert "nouls" in res
+    assert res["nouls"]["eval"]["noul"] > 0.9
