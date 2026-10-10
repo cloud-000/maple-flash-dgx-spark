@@ -90,6 +90,7 @@ class ServerDefaults:
     model_id: str = "maple-2bit"
     max_batch: int = DEFAULT_MAX_BATCH
     max_len: int = DEFAULT_MAX_LEN
+    preserve_thinking: bool = False
 
 
 @dataclass(frozen=True)
@@ -418,12 +419,17 @@ class PackedEngine:
         on_reasoning: Callable[[str], None] | None = None,
         on_tool_calls: Callable[[list[dict]], None] | None = None,
         tools: list | None = None,
+        preserve_thinking: bool = False,
     ) -> GenerateResult:
         if self.tokenizer is None:
             raise RuntimeError("PackedEngine.chat needs a tokenizer")
         tools, tools_note = resolve_chat_tools(messages, tools)
         input_ids = encode_messages(
-            self.tokenizer, messages, self.model.device, tools=tools
+            self.tokenizer,
+            messages,
+            self.model.device,
+            tools=tools,
+            preserve_thinking=preserve_thinking,
         )
         print(
             describe_chat_prompt(
@@ -976,12 +982,27 @@ def make_handler(engine: PackedEngine):
             messages = apply_system_prompt(body, parse_chat_messages(body))
             sampling = parse_sampling(body, engine.defaults)
             tools = parse_tools(body)
+            preserve_thinking = bool(
+                body.get("preserve_thinking", getattr(engine.defaults, "preserve_thinking", False))
+            )
             created = int(time.time())
             req_id = f"chatcmpl-{uuid.uuid4().hex}"
             if sampling.stream:
-                self._stream_chat(messages, sampling, req_id, created, tools=tools)
+                self._stream_chat(
+                    messages,
+                    sampling,
+                    req_id,
+                    created,
+                    tools=tools,
+                    preserve_thinking=preserve_thinking,
+                )
                 return
-            result = engine.chat(messages, sampling, tools=tools)
+            result = engine.chat(
+                messages,
+                sampling,
+                tools=tools,
+                preserve_thinking=preserve_thinking,
+            )
             self._json(
                 200,
                 chat_completion_response(
@@ -1025,6 +1046,7 @@ def make_handler(engine: PackedEngine):
             req_id: str,
             created: int,
             tools: list | None = None,
+            preserve_thinking: bool = False,
         ) -> None:
             self._stream_headers()
             try:
@@ -1083,6 +1105,7 @@ def make_handler(engine: PackedEngine):
                     on_reasoning=on_reasoning,
                     on_tool_calls=on_tool_calls,
                     tools=tools,
+                    preserve_thinking=preserve_thinking,
                 )
                 self._write_sse(
                     chat_chunk(
@@ -1187,6 +1210,7 @@ def serve(
     max_batch: int = DEFAULT_MAX_BATCH,
     max_len: int = DEFAULT_MAX_LEN,
     engine: PackedEngine | None = None,
+    preserve_thinking: bool = False,
 ) -> None:
     """Load the packed model (unless ``engine`` is given) and serve forever."""
     model_dir = str(Path(model_dir).expanduser())
@@ -1200,6 +1224,7 @@ def serve(
         model_id=Path(model_dir).name,
         max_batch=max_batch,
         max_len=max_len,
+        preserve_thinking=preserve_thinking,
     )
     if engine is None:
         print(f"Loading packed model from {model_dir}", flush=True)

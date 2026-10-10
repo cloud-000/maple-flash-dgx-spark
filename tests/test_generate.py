@@ -79,6 +79,17 @@ def test_encode_messages_forwards_tools_and_tool_calls():
     assert tok.captured_messages[1]["tool_calls"][0]["function"]["name"] == "read_file"
 
 
+
+
+def test_encode_messages_forwards_preserve_thinking():
+    tok = _CapturingTokenizer()
+    encode_messages(tok, [{"role": "user", "content": "hi"}], "cpu", preserve_thinking=True)
+    assert tok.captured_kwargs.get("preserve_thinking") is True
+
+    tok = _CapturingTokenizer()
+    encode_messages(tok, [{"role": "user", "content": "hi"}], "cpu", preserve_thinking=False)
+    assert "preserve_thinking" not in tok.captured_kwargs
+
 def test_encode_messages_omits_empty_tools():
     tok = _CapturingTokenizer()
     encode_messages(tok, [{"role": "user", "content": "hi"}], "cpu", tools=None)

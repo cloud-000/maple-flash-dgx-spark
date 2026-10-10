@@ -14,11 +14,11 @@ Or run directly as a CLI script:
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
+from pathlib import Path
+
 import pytest
 from transformers import AutoTokenizer
-
 
 CHECKPOINT_DIR = Path(__file__).resolve().parent.parent / "checkpoints" / "maple-2bit"
 
@@ -70,7 +70,9 @@ def test_huggingface_assistant_tokens_mask(tokenizer):
     assert "assistant_masks" in result, "Result must contain assistant_masks"
     input_ids = result["input_ids"]
     assistant_masks = result["assistant_masks"]
-    assert len(input_ids) == len(assistant_masks), "input_ids and assistant_masks must match in length"
+    assert len(input_ids) == len(assistant_masks), (
+        "input_ids and assistant_masks must match in length"
+    )
 
     # Assistant mask must contain 1s for the assistant generation
     assert sum(assistant_masks) > 0, "HF validator failed: assistant_masks sum is 0!"
@@ -152,11 +154,114 @@ def test_multi_turn_think_history_stripped(tokenizer):
         messages, tokenize=False, add_generation_prompt=True
     )
 
-    assert "Internal reasoning that should never leak into Turn 2 prompt." not in rendered, (
-        "Historical reasoning trace leaked into multi-turn prompt history!"
-    )
+    assert (
+        "Internal reasoning that should never leak into Turn 2 prompt." not in rendered
+    ), "Historical reasoning trace leaked into multi-turn prompt history!"
     assert "Action result." in rendered, "Assistant output action should be preserved."
     assert "Turn 2 follow-up" in rendered, "Latest user turn should be preserved."
+
+
+def test_turn_scoped_tool_call_think_preserved(tokenizer):
+    """Verify reasoning is preserved across multi-step tool calls in the current turn, but pruned across user turns."""
+    messages = [
+        # Turn 1: user request -> tool call with thinking -> tool response
+        {"role": "user", "content": "Calculate 2+2 and then read test.txt"},
+        {
+            "role": "assistant",
+            "content": "<think>\nStep 1: 2+2=4. Now call read tool.\n</think>\nCalling read tool.",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"path": "test.txt"}'},
+                }
+            ],
+        },
+        {"role": "tool", "content": "file contents here"},
+    ]
+    step2 = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    # Step 1's reasoning should be preserved in this intermediate step of the same turn
+    assert "Step 1: 2+2=4. Now call read tool." in step2, (
+        "Current-turn intermediate tool reasoning was pruned prematurely!"
+    )
+    assert "<think>\nStep 1: 2+2=4. Now call read tool.\n</think>" in step2
+    assert "Calling read tool." in step2
+    assert "<tool_response>\nfile contents here\n</tool_response>" in step2
+    assert step2.endswith("<|im_start|>assistant\n<think>\n")
+
+    # Now simulate completing Turn 1 and moving to Turn 2
+    messages.extend(
+        [
+            {
+                "role": "assistant",
+                "content": "<think>\nFinal step: summarizing results.\n</think>\nHere is the answer: 4 and file contents.",
+            },
+            {"role": "user", "content": "Turn 2 new question"},
+        ]
+    )
+    turn2 = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    # Both Turn 1 reasoning blocks must be pruned from Turn 2 prompt
+    assert "Step 1: 2+2=4. Now call read tool." not in turn2, (
+        "Turn 1 intermediate reasoning leaked into Turn 2!"
+    )
+    assert "Final step: summarizing results." not in turn2, (
+        "Turn 1 final reasoning leaked into Turn 2!"
+    )
+    assert "Calling read tool." in turn2
+    assert "Here is the answer: 4 and file contents." in turn2
+    assert "Turn 2 new question" in turn2
+
+
+def test_preserve_thinking_flag(tokenizer):
+    """Verify preserve_thinking flag: False (default) prunes prior turns; True keeps entire conversation reasoning."""
+    messages = [
+        {"role": "user", "content": "Turn 1 question"},
+        {
+            "role": "assistant",
+            "content": "<think>\nTurn 1 internal thoughts.\n</think>\nTurn 1 answer.",
+        },
+        {"role": "user", "content": "Turn 2 question"},
+        {
+            "role": "assistant",
+            "content": "<think>\nTurn 2 internal thoughts.\n</think>\nTurn 2 answer.",
+        },
+        {"role": "user", "content": "Turn 3 question"},
+    ]
+
+    # Default (preserve_thinking omitted or False) -> turn-scoped (prior turns stripped)
+    rendered_default = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    assert "Turn 1 internal thoughts." not in rendered_default
+    assert "Turn 2 internal thoughts." not in rendered_default
+    assert "Turn 1 answer." in rendered_default
+    assert "Turn 2 answer." in rendered_default
+    assert "Turn 3 question" in rendered_default
+
+    rendered_false = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, preserve_thinking=False
+    )
+    assert "Turn 1 internal thoughts." not in rendered_false
+    assert "Turn 2 internal thoughts." not in rendered_false
+
+    # preserve_thinking=True -> conversation-scoped (all prior turn thoughts preserved)
+    rendered_true = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, preserve_thinking=True
+    )
+    assert "Turn 1 internal thoughts." in rendered_true, (
+        "Turn 1 thinking should be preserved when preserve_thinking=True"
+    )
+    assert "Turn 2 internal thoughts." in rendered_true, (
+        "Turn 2 thinking should be preserved when preserve_thinking=True"
+    )
+    assert "<think>\nTurn 1 internal thoughts.\n</think>" in rendered_true
+    assert "<think>\nTurn 2 internal thoughts.\n</think>" in rendered_true
+    assert "Turn 1 answer." in rendered_true
+    assert "Turn 2 answer." in rendered_true
+    assert "Turn 3 question" in rendered_true
 
 
 def test_tool_function_unpacking_and_serialization(tokenizer):
@@ -224,6 +329,7 @@ def test_tool_response_wrapping(tokenizer):
 # Standalone CLI Entrypoint
 # ---------------------------------------------------------------------------
 
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run chat template verification suite on a template file or raw string."
@@ -235,13 +341,15 @@ def main() -> int:
         help="Optional path to template file or raw template string",
     )
     parser.add_argument(
-        "-f", "--file",
+        "-f",
+        "--file",
         dest="file_path",
         default=None,
         help="Path to chat template file to test",
     )
     parser.add_argument(
-        "-t", "--text",
+        "-t",
+        "--text",
         dest="template_text",
         default=None,
         help="Raw chat template string to test",
@@ -285,12 +393,23 @@ def main() -> int:
     print("-" * 75)
 
     all_tests = [
-        ("HF Assistant Mask ({% generation %})", test_huggingface_assistant_tokens_mask),
+        (
+            "HF Assistant Mask ({% generation %})",
+            test_huggingface_assistant_tokens_mask,
+        ),
         ("Atomic Special Tokens", test_special_tokens_atomic),
         ("Generation Prompt Contract", test_generation_prompt_contract),
         ("Clean Newlines (no literal \\n)", test_no_escaped_newlines),
         ("Prune Prior <think> from History", test_multi_turn_think_history_stripped),
-        ("Tool Function Schema Unpacking", test_tool_function_unpacking_and_serialization),
+        (
+            "Turn-Scoped Tool Call <think> Preserved",
+            test_turn_scoped_tool_call_think_preserved,
+        ),
+        ("Preserve Thinking Flag Across Conversation", test_preserve_thinking_flag),
+        (
+            "Tool Function Schema Unpacking",
+            test_tool_function_unpacking_and_serialization,
+        ),
         ("Tool Response Wrapping", test_tool_response_wrapping),
     ]
 

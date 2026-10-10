@@ -329,7 +329,12 @@ def _to_input_ids(encoded, device) -> torch.Tensor:
 
 
 def encode_messages(
-    tokenizer, messages: list[dict], device, *, tools: list | None = None
+    tokenizer,
+    messages: list[dict],
+    device,
+    *,
+    tools: list | None = None,
+    preserve_thinking: bool = False,
 ) -> torch.Tensor:
     """Apply the chat template, or concatenate roles if the tokenizer has none.
 
@@ -340,6 +345,8 @@ def encode_messages(
             "add_generation_prompt": True,
             "return_tensors": "pt",
         }
+        if preserve_thinking:
+            kwargs["preserve_thinking"] = True
         if tools:
             kwargs["tools"] = tools
         encoded = tokenizer.apply_chat_template(cleaned, **kwargs)

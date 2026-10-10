@@ -4,7 +4,7 @@ Packed ternary CUDA runtime for [deepgrove/maple-preview](https://huggingface.co
 
 This is **not** a vLLM wrapper. Maple's Hugging Face dump is native-ternary values stored as bf16 (~40 GB). The Mac 220 tok/s path uses packed 2-bit weights (~5.3 GB) plus custom kernels. This repo is that path on CUDA.
 
-Conversion, packed GEMV, packed decode, FlashHead, and HTTP serving are implemented. Correctness and quantization reference: [`docs/FIDELITY.md`](docs/FIDELITY.md). Historical implementation record: [`docs/HANDOFF.md`](docs/HANDOFF.md). Agent rules: [`AGENTS.md`](AGENTS.md). Local sources: [`docs/SOURCES.md`](docs/SOURCES.md).
+Conversion, packed GEMV, packed decode, FlashHead, and HTTP serving are implemented. Correctness and quantization reference: [`docs/FIDELITY.md`](docs/FIDELITY.md). Chat template and reasoning retention: [`docs/CHAT_TEMPLATE.md`](docs/CHAT_TEMPLATE.md). Historical implementation record: [`docs/HANDOFF.md`](docs/HANDOFF.md). Agent rules: [`AGENTS.md`](AGENTS.md). Local sources: [`docs/SOURCES.md`](docs/SOURCES.md).
 
 ```bash
 uv sync --extra cuda --extra tokenizer --extra eval

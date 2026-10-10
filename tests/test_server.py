@@ -242,6 +242,7 @@ def test_cli_serve_help(capsys):
     assert "--max-len" in out
     assert "(default 8)" in out
     assert "(default 8192)" in out
+    assert "--preserve-thinking" in out
 
 
 def test_cli_serve_rejects_bad_sampling():
@@ -265,6 +266,7 @@ class FakeEngine:
     last_sampling: object | None = None
     last_tools: object | None = None
     last_messages: object | None = None
+    last_preserve_thinking: bool = False
 
     tool_calls: list = field(default_factory=list)
 
@@ -276,10 +278,12 @@ class FakeEngine:
         on_reasoning=None,
         on_tool_calls=None,
         tools=None,
+        preserve_thinking=False,
     ):
         self.last_sampling = sampling
         self.last_tools = tools
         self.last_messages = messages
+        self.last_preserve_thinking = preserve_thinking
         if on_reasoning is not None and self.reasoning:
             on_reasoning(self.reasoning)
         if on_text is not None:
@@ -490,6 +494,32 @@ def test_http_chat_forwards_tools_and_keeps_tool_calls():
         assert engine.last_tools == tools
         assert engine.last_messages[1]["tool_calls"][0]["function"]["name"] == "read_file"
 
+
+
+
+def test_http_chat_respects_preserve_thinking():
+    engine = FakeEngine()
+    with _server(engine) as port:
+        status, body, _ = _post(
+            port,
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                "preserve_thinking": True,
+            },
+        )
+        assert status == 200
+        assert engine.last_preserve_thinking is True
+
+        status, body, _ = _post(
+            port,
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        assert status == 200
+        assert engine.last_preserve_thinking is False
 
 def test_http_chat_stream_reasoning():
     engine = FakeEngine(text="Paris", reasoning="capital city")

@@ -11,6 +11,9 @@ kernels on DGX Spark (GB10, sm_121). It is a custom runtime, not a vLLM recipe.
 ## Documentation map
 
 - `AGENTS.md` is the current operating guide and repository status summary.
+- `docs/CHAT_TEMPLATE.md` defines the ChatML chat template syntax, role
+  normalization, reasoning (`<think>`) retention scopes (conversation vs.
+  stateless vs. turn-scoped), and verification suite.
 - `docs/FIDELITY.md` defines the A/B/C model representations, quantization
   boundaries, fidelity methodology, known reference-loader pitfall, and
   September 2026 baseline measurements. Read it before changing conversion,

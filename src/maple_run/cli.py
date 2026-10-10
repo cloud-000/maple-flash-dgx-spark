@@ -189,6 +189,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_sampling_args(serve)
     _add_dense_head_args(serve)
+    serve.add_argument(
+        "--preserve-thinking",
+        action="store_true",
+        help="Preserve <think> reasoning traces across all turns in conversation history (default: turn-scoped)",
+    )
 
     # 5. evaluate
     evaluate = sub.add_parser(
@@ -324,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
             dense_head_source=args.original if args.dense_head else None,
             max_batch=args.max_batch,
             max_len=args.max_len,
+            preserve_thinking=args.preserve_thinking,
         )
         return 0
 
