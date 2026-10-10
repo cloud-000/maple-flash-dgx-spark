@@ -12,6 +12,18 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="run packed-model decode speed benches (loads maple-2bit)",
     )
+    parser.addoption(
+        "--template-file",
+        action="store",
+        default=None,
+        help="path to a chat template jinja file to test in test_chat_template.py",
+    )
+    parser.addoption(
+        "--template-text",
+        action="store",
+        default=None,
+        help="raw chat template string to test in test_chat_template.py",
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
